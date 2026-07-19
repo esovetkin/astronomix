@@ -36,6 +36,7 @@ from astronomix import (
     GravityConfig,
     PositivityConfig,
     SnapshotSettings,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -69,7 +70,7 @@ def _backend_kwargs(backend):
     """
     if backend == PALLAS:
         return {}
-    return dict(backend=NATIVE_JAX)
+    return dict(backend_config=BackendConfig(backend=NATIVE_JAX))
 
 
 def collapse_config(
@@ -134,7 +135,7 @@ def collapse_config(
             limiter=MINMOD,
             time_integrator=RK2_SSP,
             riemann_solver=HLLC,
-            backend=NATIVE_JAX,
+            backend_config=BackendConfig(backend=NATIVE_JAX),
             **common,
         )
 

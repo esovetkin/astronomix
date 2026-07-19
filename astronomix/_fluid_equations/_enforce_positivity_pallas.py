@@ -48,7 +48,7 @@ def _enforce_positivity_pallas_supported(state, config: SimulationConfig) -> boo
         return False
     if state.ndim != ndim + 1:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state.shape[1:])
     for n, b in zip(state.shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -75,7 +75,7 @@ def _enforce_positivity_pallas(
     # opaque pallas_call — the wrapper just runs the kernel locally on
     # each shard.
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
 
     def _local(state_local):
         return _enforce_positivity_pallas_local(
@@ -116,7 +116,7 @@ def _enforce_positivity_pallas_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     DENSITY = int(registered_variables.density_index)
@@ -251,7 +251,7 @@ def _enforce_positivity_pallas_local(
         grid=grid,
         in_specs=[in_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="enforce_positivity",
         **kwargs,
     )(
@@ -279,14 +279,14 @@ def _redistribute_positivity_pallas_supported(state, config: SimulationConfig) -
         return False
     if config.equation_of_state not in (IDEAL_GAS, ISOTHERMAL):
         return False
-    if jax.config.jax_enable_x64 and not bool(getattr(config, "pallas_interpret", False)):
+    if jax.config.jax_enable_x64 and not bool(config.backend_config.pallas_interpret):
         return False
     ndim = int(config.dimensionality)
     if ndim not in (1, 2, 3):
         return False
     if state.ndim != ndim + 1:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state.shape[1:])
     for n, b in zip(state.shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -305,7 +305,7 @@ def _redistribute_positivity_pallas(
     """Public shard-aware wrapper for the neighbour-redistribution kernel."""
     assert _redistribute_positivity_pallas_supported(conserved_state, config)
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
 
     def _local(state_local):
         return _redistribute_positivity_pallas_local(
@@ -339,7 +339,7 @@ def _redistribute_positivity_pallas_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     vacuum_rest = bool(config.positivity_config.vacuum_rest)
@@ -486,7 +486,7 @@ def _redistribute_positivity_pallas_local(
         grid=grid,
         in_specs=[in_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="redistribute_positivity",
         **kwargs,
     )(

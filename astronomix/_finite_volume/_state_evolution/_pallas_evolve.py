@@ -161,9 +161,9 @@ def _fv_pallas_evolve_supported(state, config: SimulationConfig) -> bool:
         return False
     if state.ndim != ndim + 1:
         return False
-    if jax.config.jax_enable_x64 and not config.pallas_interpret:
+    if jax.config.jax_enable_x64 and not config.backend_config.pallas_interpret:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state.shape[1:])
     for n, b in zip(state.shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -205,7 +205,7 @@ def _fv_evolve_axis_pallas(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     if is_mhd:
@@ -509,7 +509,7 @@ def _fv_evolve_axis_pallas(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"fv_evolve_axis_{axis_index}{'_acc' if accumulate else ''}",
         **kwargs,
     )(*kernel_args)

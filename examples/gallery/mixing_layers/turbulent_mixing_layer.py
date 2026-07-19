@@ -62,6 +62,7 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     PositivityConfig,
+    BackendConfig,
 )
 from astronomix.option_classes.simulation_params import (
     FixedBoundaryState,
@@ -143,7 +144,9 @@ config = SimulationConfig(
     # positivity protection replaces the old enforce_positivity flag; keep it on
     # so the strong density contrast plus cooling stays stable
     positivity_config=PositivityConfig(default_positivity_protection=True),
-    pallas_block_shape=(4, 4, 4),
+    backend_config=BackendConfig(
+        pallas_block_shape=(4, 4, 4),
+    ),
     progress_bar=True,
     dimensionality=3,
     box_size=StaticFloatVector(L_x, L_y, L_z),

@@ -145,7 +145,7 @@ class KHParams(NamedTuple):
 def _build_backend(khp, horizon, pallas):
     """Config + params for the backward (reverse-mode) inviscid KH solver."""
     import jax.numpy as jnp  # noqa: F401  (kept local so `plot`/`agg` need no jax)
-    from astronomix import SimulationConfig, SimulationParams
+    from astronomix import SimulationConfig, SimulationParams, BackendConfig
     from astronomix.option_classes.simulation_config import (
         BACKWARDS, DYNAMIC_VISCOSITY, FINITE_DIFFERENCE, OPEN_BOUNDARY, PALLAS,
         PERIODIC_BOUNDARY, BoundarySettings, BoundarySettings1D, SnapshotSettings,
@@ -162,8 +162,9 @@ def _build_backend(khp, horizon, pallas):
             y=BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY)),
     )
     if pallas:
-        config = config._replace(backend=PALLAS, pallas_block_shape=PALLAS_BLOCK,
-                                 pallas_use_triton=True)
+        config = config._replace(backend_config=config.backend_config._replace(
+            backend=PALLAS, pallas_block_shape=PALLAS_BLOCK,
+            pallas_use_triton=True))
     params = SimulationParams(viscosity=khp.viscosity, t_end=T, C_cfl=khp.c_cfl, gamma=khp.gamma)
     return config, params, T
 

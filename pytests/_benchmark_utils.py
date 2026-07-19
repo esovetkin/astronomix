@@ -47,6 +47,7 @@ from astronomix import (
     SimulationConfig,
     SnapshotSettings,
     SimulationParams,
+    BackendConfig,
 )
 from astronomix.option_classes.simulation_config import StaticIntVector
 
@@ -78,6 +79,40 @@ def grid_shape_3d(N: int) -> StaticIntVector:
 def _slug(text: str) -> str:
     """Lowercase, alphanumeric-and-underscore version of ``text``."""
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+#: GPU families we name explicitly, longest-first so that e.g. "gh200" is not
+#: mistaken for "h200" and "h100" is not matched inside "gh100".
+_KNOWN_GPUS = (
+    "gh200", "gb200", "b200", "b100",
+    "h200", "h100", "a100", "v100",
+    "l40s", "l40", "l4", "a40", "a30", "a10",
+    "rtx6000", "a6000",
+)
+
+
+def node_tag() -> str:
+    """Return a directory-safe tag for the GPU this process is running on.
+
+    Benchmark runtimes are only comparable within one GPU generation, so every
+    sweep stores its data under ``<data_dir>/<node_tag()>/``. Deriving the tag
+    from the live device (rather than a flag) means a run physically cannot be
+    filed under the wrong hardware -- the failure mode that previously mixed
+    H100 runtimes into an A100 dataset.
+
+    Recognises the datacenter parts explicitly (a100/h100/h200/...) and falls
+    back to a slug of the device kind for anything unknown, so a new GPU gets
+    its own folder instead of raising.
+    """
+    kind = jax.devices()[0].device_kind
+    low = kind.lower()
+    for known in _KNOWN_GPUS:
+        if known in low.replace(" ", "").replace("-", ""):
+            return known
+    # Unknown hardware: keep going under a readable slug rather than failing a
+    # long sweep at the very end when it tries to write its results.
+    slug = _slug(low.replace("nvidia", ""))
+    return slug or "unknown_gpu"
 
 
 def _ensure_dirs(*paths: str) -> None:
@@ -115,6 +150,28 @@ def _ensure_snapshot_config(config: SimulationConfig) -> SimulationConfig:
     return config._replace(**updates) if updates else config
 
 
+#: Robust timing (``robust_timing=True``): keep re-running the integration until
+#: the accumulated timed wall-clock reaches this, so a sporadic one-off cost is a
+#: small fraction of at least one sample. Small grids are cheap, so this costs
+#: little; large grids exceed it on the first run and are measured once.
+_ROBUST_TIMING_TARGET_S = 1.0
+#: Hard cap on repeats, so a pathologically fast configuration cannot spin. Sized
+#: so the cheapest points (a 20-step N=8 run is ~0.02 s) can still approach the
+#: target: with a cap of 5 they never got near it and kept a ~20% spread.
+_ROBUST_TIMING_MAX_REPEATS = 25
+#: Size of the sporadic one-off cost that contaminates a timed region (measured
+#: 2026-07-17 on H100: ~0.1 s, hitting roughly one run in three).
+_ROBUST_TIMING_SPIKE_S = 0.1
+#: Relative error we are willing to inherit from a spike we failed to dodge.
+_ROBUST_TIMING_TOL = 0.01
+#: Minimum samples whenever a spike could still matter. Reaching the wall-clock
+#: target is NOT sufficient on its own: a 1 s run that gets spiked is still 10%
+#: wrong, which is how the 20-step N=128 sp/dp point read 71.3 ms/iter against
+#: the 981-step convergence sweep's 65.4. With p(spike) ~ 1/3, 3 samples leave a
+#: ~4% chance that every one is contaminated, and the min discards the rest.
+_ROBUST_TIMING_MIN_SAMPLES = 3
+
+
 def _run_simulation(
     spec: BenchmarkSpec,
     N: int,
@@ -123,6 +180,7 @@ def _run_simulation(
     *,
     num_timesteps: Optional[int] = None,
     t_end: Optional[float] = None,
+    robust_timing: bool = False,
 ):
     """Build the per-N config, set up the IC, optionally shard, integrate.
 
@@ -133,6 +191,25 @@ def _run_simulation(
     comparable across grid sizes, which is what the scaling sweeps want.
     ``t_end`` (optional) overrides the end time set by ``setup_fn`` (with
     ``num_timesteps`` fixed, ``dt = t_end / num_timesteps``).
+
+    ``robust_timing`` (default off, so existing callers are unchanged) makes the
+    reported ``result.runtime`` trustworthy for CHEAP configurations. A single
+    unrepeated run is contaminated by a sporadic ~0.1 s one-off cost that lands
+    inside the timed region in roughly one run out of three (measured 2026-07-17,
+    H100: the same N=8 config alternates between ~0.7 and ~2.4 ms/iter with
+    clocks pinned at 1980 MHz and no thermal throttling, and the inflation hops
+    between N=8 and N=16 from sweep to sweep). Because ``runtime`` is divided by
+    the iteration count, that fixed cost is a ~4x error at N=8 (0.04 s of work)
+    and invisible at N=128 (64 s) -- which is exactly the "smallest grid is
+    slower than the next one up" artifact.
+
+    The contamination is ADDITIVE and one-sided, so the estimator is the MINIMUM
+    over repeats, not the mean: the fastest sample is the one that escaped the
+    hiccup. Cheap configurations are repeated (at least ``_ROBUST_TIMING_MIN_SAMPLES``,
+    and on until the accumulated wall reaches ``_ROBUST_TIMING_TARGET_S``); a run
+    already long enough that a missed spike stays inside ``_ROBUST_TIMING_TOL``
+    (>= 10 s) is measured exactly once, so the expensive end of a sweep costs no
+    extra wall-clock.
     """
     # Clear JIT/compilation caches between successive runs. Reusing the same
     # cached compile across (sharded, unsharded) inputs surfaces as
@@ -155,16 +232,47 @@ def _run_simulation(
     if sharding is not None:
         initial_state = jax.device_put(initial_state, sharding)
 
-    result = time_integration(
-        initial_state,
-        config,
-        params,
-        registered_variables,
-        sharding=sharding,
-    )
-    # Make sure compute has finished before we read runtime/memory back.
-    if hasattr(result, "final_state") and result.final_state is not None:
-        result.final_state.block_until_ready()
+    def _integrate():
+        r = time_integration(
+            initial_state,
+            config,
+            params,
+            registered_variables,
+            sharding=sharding,
+        )
+        # Make sure compute has finished before we read runtime/memory back.
+        if hasattr(r, "final_state") and r.final_state is not None:
+            r.final_state.block_until_ready()
+        return r
+
+    result = _integrate()
+
+    if robust_timing and hasattr(result, "runtime"):
+        # The first run also warms up anything that is lazily initialised on the
+        # first launch of a freshly compiled program; taking the min over the
+        # samples discards it along with any other one-off cost.
+        samples = [float(result.runtime)]
+        # A run long enough that even a missed spike stays within tolerance
+        # (0.1 s / 0.01 = 10 s) needs no repeat -- that is the expensive end of
+        # the sweep, where repeating would dominate the wall-clock budget.
+        negligible_s = _ROBUST_TIMING_SPIKE_S / _ROBUST_TIMING_TOL
+        if samples[0] < negligible_s:
+            while len(samples) < _ROBUST_TIMING_MAX_REPEATS and (
+                len(samples) < _ROBUST_TIMING_MIN_SAMPLES
+                or sum(samples) < _ROBUST_TIMING_TARGET_S
+            ):
+                samples.append(float(_integrate().runtime))
+        best = min(samples)
+        if len(samples) > 1:
+            spread = 100.0 * (max(samples) - best) / best if best else float("nan")
+            print(
+                f"[timing] N={N} {spec.label}: {len(samples)} samples, "
+                f"min={best:.4f}s, max={max(samples):.4f}s, spread={spread:.0f}% "
+                f"-> reporting min",
+                flush=True,
+            )
+        result = result._replace(runtime=best)
+
     return result, config, params, registered_variables, helper_data
 
 
@@ -229,9 +337,10 @@ def run_convergence_and_runtime(
     *,
     name: str,
     title: str,
+    runtime_title: Optional[str] = None,
     data_dir: str,
     figure_dir: str,
-    athenapk_npz: Optional[str] = None,
+    reference_npzs: Optional[Sequence[tuple[str, str]]] = None,
 ) -> dict:
     """Run the convergence + runtime sweep for every benchmark.
 
@@ -240,32 +349,35 @@ def run_convergence_and_runtime(
       * ``{figure_dir}/{name}_runtime.svg``     — error/runtime, runtime/N,
         time-per-iteration/N
 
-    and one NPZ per benchmark in ``{data_dir}``. Returns a dict keyed by
-    benchmark label with the captured arrays.
+    and one NPZ per benchmark in ``{data_dir}``. ``reference_npzs`` is a list
+    of ``(legend label, npz path)`` overlays (e.g. AthenaPK measurements) in
+    the same NPZ format. Returns a dict keyed by benchmark label with the
+    captured arrays.
     """
     _ensure_dirs(data_dir, figure_dir)
 
     results = {}
-    for spec in benchmarks:
-        results[spec.label] = dict(N=[], l1=[], runtime=[], iterations=[])
-
-    fig_err, ax_err = plt.subplots(1, 1, figsize=(8, 6))
-    fig_rt, ax_rt = plt.subplots(3, 1, figsize=(8, 12))
 
     # -------------------------------------------------------------
     # ====== ↓ Run the sweep and collect per-benchmark curves ↓ ===
     # -------------------------------------------------------------
 
     # For every benchmark and resolution we integrate the wave, measure the L1
-    # error against the analytic solution plus the runtime, plot the curves and
-    # persist the raw arrays to an NPZ so the figures can be regenerated later.
+    # error against the analytic solution plus the runtime, and persist the raw
+    # arrays to an NPZ so the figures can be regenerated later without a sweep.
     for spec in benchmarks:
+        results[spec.label] = dict(N=[], l1=[], runtime=[], iterations=[])
         for N in N_values:
             result, config, params, registered_variables, helper_data = _run_simulation(
                 spec,
                 N,
                 setup_fn,
                 num_gpus=1,
+                # The small-N end of this sweep runs for only ~0.04-0.2 s, where a
+                # sporadic ~0.1 s one-off cost inside the timed region distorts
+                # ms/iter by 2-4x (see _run_simulation). Costs nothing at large N,
+                # which already exceeds the repeat target on the first run.
+                robust_timing=True,
             )
 
             indices = error_var_indices_fn(registered_variables)
@@ -281,40 +393,6 @@ def run_convergence_and_runtime(
 
             print(f"[{name}] {spec.label} N={N}: L1={err:.3e}, runtime={runtime:.2f}s, iters={iters}")
 
-        ax_err.loglog(
-            N_values,
-            results[spec.label]["l1"],
-            marker="o",
-            linewidth=2,
-            label=spec.label,
-        )
-        ax_rt[0].loglog(
-            results[spec.label]["runtime"],
-            results[spec.label]["l1"],
-            marker="o",
-            linewidth=2,
-            label=spec.label,
-        )
-        ax_rt[1].loglog(
-            N_values,
-            results[spec.label]["runtime"],
-            marker="o",
-            linewidth=2,
-            label=spec.label,
-        )
-        time_per_iter = [
-            rt / nit for rt, nit in zip(
-                results[spec.label]["runtime"], results[spec.label]["iterations"]
-            )
-        ]
-        ax_rt[2].loglog(
-            N_values,
-            time_per_iter,
-            marker="o",
-            linewidth=2,
-            label=spec.label,
-        )
-
         np.savez(
             os.path.join(data_dir, f"{name}_convergence_{_slug(spec.label)}.npz"),
             N_values=np.array(N_values),
@@ -327,36 +405,117 @@ def run_convergence_and_runtime(
     # ====== ↑ Run the sweep and collect per-benchmark curves ↑ ===
     # -------------------------------------------------------------
 
-    # Overlay the reference AthenaPK curve (when provided) for direct comparison.
-    if athenapk_npz is not None and os.path.exists(athenapk_npz):
-        athena = np.load(athenapk_npz)
+    plot_convergence_and_runtime(
+        results,
+        N_values,
+        name=name,
+        title=title,
+        runtime_title=runtime_title,
+        figure_dir=figure_dir,
+        reference_npzs=reference_npzs,
+    )
+
+    return results
+
+
+def plot_convergence_and_runtime(
+    results: dict,
+    N_values: Sequence[int],
+    *,
+    name: str,
+    title: str,
+    runtime_title: Optional[str] = None,
+    figure_dir: str,
+    reference_npzs: Optional[Sequence[tuple[str, str]]] = None,
+) -> None:
+    """Render the convergence + runtime figures from captured sweep arrays.
+
+    ``results`` maps benchmark label -> dict with ``N``, ``l1``, ``runtime``
+    and ``iterations`` sequences (the return value of
+    :func:`run_convergence_and_runtime`, or the per-benchmark NPZs loaded back
+    from disk). Split out from the sweep so figures can be regenerated —
+    e.g. with updated reference overlays — without redoing the GPU runs.
+
+    ``runtime_title`` (default: ``title``) titles the runtime figure only.
+    L1 error is a property of the scheme, not the machine — it is identical on
+    every GPU — so the convergence figure should not name hardware, while the
+    runtime figure must.
+    """
+    runtime_title = runtime_title or title
+    _ensure_dirs(figure_dir)
+
+    fig_err, ax_err = plt.subplots(1, 1, figsize=(8, 6))
+    fig_rt, ax_rt = plt.subplots(3, 1, figsize=(8, 12))
+
+    for label, rec in results.items():
         ax_err.loglog(
-            athena["N_values"],
-            athena["l1_errors"],
-            marker="s",
+            N_values,
+            rec["l1"],
+            marker="o",
             linewidth=2,
-            label="AthenaPK",
+            label=label,
         )
         ax_rt[0].loglog(
-            athena["runtimes"],
-            athena["l1_errors"],
-            marker="s",
+            rec["runtime"],
+            rec["l1"],
+            marker="o",
             linewidth=2,
-            label="AthenaPK",
+            label=label,
         )
         ax_rt[1].loglog(
-            athena["N_values"],
-            athena["runtimes"],
-            marker="s",
+            N_values,
+            rec["runtime"],
+            marker="o",
             linewidth=2,
-            label="AthenaPK",
+            label=label,
+        )
+        time_per_iter = [
+            rt / nit for rt, nit in zip(rec["runtime"], rec["iterations"])
+        ]
+        ax_rt[2].loglog(
+            N_values,
+            time_per_iter,
+            marker="o",
+            linewidth=2,
+            label=label,
+        )
+
+    # Overlay the reference curves (e.g. AthenaPK) for direct comparison; each
+    # overlay gets its own marker so the variants stay distinguishable.
+    ref_markers = ["s", "D", "^", "v"]
+    for i, (ref_label, ref_npz) in enumerate(reference_npzs or []):
+        if not os.path.exists(ref_npz):
+            print(f"[{name}] reference NPZ missing, skipping overlay: {ref_npz}")
+            continue
+        ref = np.load(ref_npz)
+        marker = ref_markers[i % len(ref_markers)]
+        ax_err.loglog(
+            ref["N_values"],
+            ref["l1_errors"],
+            marker=marker,
+            linewidth=2,
+            label=ref_label,
+        )
+        ax_rt[0].loglog(
+            ref["runtimes"],
+            ref["l1_errors"],
+            marker=marker,
+            linewidth=2,
+            label=ref_label,
+        )
+        ax_rt[1].loglog(
+            ref["N_values"],
+            ref["runtimes"],
+            marker=marker,
+            linewidth=2,
+            label=ref_label,
         )
         ax_rt[2].loglog(
-            athena["N_values"],
-            [t / i for t, i in zip(athena["runtimes"], athena["iterations"])],
-            marker="s",
+            ref["N_values"],
+            [t / i for t, i in zip(ref["runtimes"], ref["iterations"])],
+            marker=marker,
             linewidth=2,
-            label="AthenaPK",
+            label=ref_label,
         )
 
     # Reference convergence slopes: the FV scheme is expected to approach
@@ -365,8 +524,8 @@ def run_convergence_and_runtime(
     N_arr = np.array(N_values, dtype=float)
     ref2 = (N_arr / N_arr[0]) ** -2.0
     ref5 = (N_arr / N_arr[0]) ** -5.0
-    max_err_start = max(r["l1"][0] for r in results.values() if r["l1"])
-    min_err_start = min(r["l1"][0] for r in results.values() if r["l1"])
+    max_err_start = max(r["l1"][0] for r in results.values() if len(r["l1"]))
+    min_err_start = min(r["l1"][0] for r in results.values() if len(r["l1"]))
     ax_err.loglog(
         N_arr,
         max_err_start * ref2,
@@ -397,7 +556,7 @@ def run_convergence_and_runtime(
 
     ax_rt[0].set_xlabel("Runtime (s)", fontsize=12)
     ax_rt[0].set_ylabel("Average $L_1$ error", fontsize=12)
-    ax_rt[0].set_title(f"{title}: error vs runtime", fontsize=13)
+    ax_rt[0].set_title(f"{runtime_title}: error vs runtime", fontsize=13)
     ax_rt[1].set_xlabel("N (grid size: 2N x N x N)", fontsize=12)
     ax_rt[1].set_ylabel("Runtime (s)", fontsize=12)
     ax_rt[1].set_title("Runtime vs N", fontsize=13)
@@ -415,8 +574,6 @@ def run_convergence_and_runtime(
     # -------------------------------------------------------------
     # ============= ↑ Style and write the figures ↑ ===============
     # -------------------------------------------------------------
-
-    return results
 
 
 def _single_gpu_byte_budget() -> int:
@@ -676,7 +833,7 @@ def _gpu_metadata(num_gpus: int) -> dict:
 
 
 def _spec_block_shape(spec: "BenchmarkSpec"):
-    bs = getattr(spec.base_config, "pallas_block_shape", None)
+    bs = spec.base_config.backend_config.pallas_block_shape
     return list(bs) if bs is not None else None
 
 
@@ -788,7 +945,7 @@ def run_block_shape_sweep(
         temp_bytes=[], arg_bytes=[], total_bytes=[],
     )
     for bs in block_shapes:
-        cfg = base_config._replace(pallas_block_shape=tuple(bs))
+        cfg = base_config._replace(backend_config=base_config.backend_config._replace(pallas_block_shape=tuple(bs)))
         spec = BenchmarkSpec(label=f"{label} {tuple(bs)}", base_config=cfg, cfl=cfl)
         try:
             r, *_ = _run_simulation(
@@ -924,7 +1081,7 @@ def run_weak_scaling_point(
             _gpu_metadata(G),
             setup=setup_key,
             solver_label="FD (Pallas)",
-            pallas_block_shape=list(getattr(base_config, "pallas_block_shape", []) or []),
+            pallas_block_shape=list(base_config.backend_config.pallas_block_shape or []),
             time_integrator=int(getattr(base_config, "time_integrator", -1)),
             num_timesteps=int(num_timesteps),
             box_size=list(box_size),

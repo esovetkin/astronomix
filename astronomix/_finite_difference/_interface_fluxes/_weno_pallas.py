@@ -2,7 +2,7 @@
 
 This file is the **Pallas backend** for the WENO interface-flux step.  All
 native-JAX implementations live in ``_weno.py``; the dispatchers there
-import from this file and call into it when ``config.backend == PALLAS``
+import from this file and call into it when ``config.backend_config.backend == PALLAS``
 and the per-flavour ``_*_pallas_flux_supported`` predicate accepts.
 
 A developer who only writes / modifies native JAX never needs to touch
@@ -44,6 +44,10 @@ from astronomix._pallas_helpers import (
     pl,
     pltriton,
 )
+from astronomix._finite_difference._interface_fluxes._weno_weights import (
+    _weno_omega_weights,
+    _weno_omega_weights_adjoint,
+)
 
 
 def _weno5_shard_wrap(kernel_local, conserved_state, config, axis):
@@ -60,7 +64,7 @@ def _weno5_shard_wrap(kernel_local, conserved_state, config, axis):
     forwards to ``kernel_local`` — single-device runs are unaffected.
     """
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     halo_list = [0, 0, 0]
     if 0 <= int(axis) < ndim:
         halo_list[int(axis)] = 3
@@ -101,13 +105,13 @@ _MHD_VJP_FULL_HANDDERIVE = False
 
 
 def _backend_name(config: SimulationConfig) -> str:
-    """Return a robust string representation of config.backend.
+    """Return a robust string representation of config.backend_config.backend.
 
     This intentionally does not import PALLAS/NATIVE_JAX constants.  It works with
     string constants, enum values, or small dataclass-like constant objects whose
     ``name`` or ``value`` carries the backend name.
     """
-    backend = config.backend
+    backend = config.backend_config.backend
     name = getattr(backend, "name", None)
     if name is not None:
         return str(name).upper()
@@ -139,7 +143,7 @@ def _hydro_pallas_flux_supported(conserved_state, config: SimulationConfig) -> b
         return False
     if conserved_state.ndim != ndim + 1:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     spatial_shape = conserved_state.shape[1:]
     for n, b in zip(spatial_shape, block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
@@ -398,7 +402,7 @@ def _weno_hydro_flux_from_window(q_stencil, gamma, rhomin, pgmin, ncomp, num_mod
         return amx
 
     flux_acc = [
-        (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) / 12.0
+        (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
         for slot in range(ncomp)
     ]
 
@@ -428,15 +432,10 @@ def _weno_hydro_flux_from_window(q_stencil, gamma, rhomin, pgmin, ncomp, num_mod
         IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
         IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
         IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-        alpha0_p = 1.0 / (epsilon + IS0_p) ** 2
-        alpha1_p = 6.0 / (epsilon + IS1_p) ** 2
-        alpha2_p = 3.0 / (epsilon + IS2_p) ** 2
-        alpha_sum_p = jnp.maximum(alpha0_p + alpha1_p + alpha2_p, tiny)
-        omega0_p = alpha0_p / alpha_sum_p
-        omega2_p = alpha2_p / alpha_sum_p
+        omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
         second = (
-            omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) / 3.0
-            + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) / 6.0
+            omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+            + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0)
         )
 
         aterm_m = 0.5 * (d4 - amx * dq4)
@@ -447,15 +446,10 @@ def _weno_hydro_flux_from_window(q_stencil, gamma, rhomin, pgmin, ncomp, num_mod
         IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
         IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
         IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-        alpha0_m = 1.0 / (epsilon + IS0_m) ** 2
-        alpha1_m = 6.0 / (epsilon + IS1_m) ** 2
-        alpha2_m = 3.0 / (epsilon + IS2_m) ** 2
-        alpha_sum_m = jnp.maximum(alpha0_m + alpha1_m + alpha2_m, tiny)
-        omega0_m = alpha0_m / alpha_sum_m
-        omega2_m = alpha2_m / alpha_sum_m
+        omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
         third = (
-            omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) / 3.0
-            + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) / 6.0
+            omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+            + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
         )
 
         Fs = -second + third
@@ -697,33 +691,25 @@ def _weno_hydro_flux_from_window_adjoint(
         IS0 = 13.0 * (aterm - bterm) ** 2 + 3.0 * (aterm - 3.0 * bterm) ** 2
         IS1 = 13.0 * (bterm - cterm) ** 2 + 3.0 * (bterm + cterm) ** 2
         IS2 = 13.0 * (cterm - dterm) ** 2 + 3.0 * (3.0 * cterm - dterm) ** 2
-        a0 = 1.0 / (epsilon + IS0) ** 2; a1 = 6.0 / (epsilon + IS1) ** 2; a2 = 3.0 / (epsilon + IS2) ** 2
-        asum = jnp.maximum(a0 + a1 + a2, tiny)
-        om0 = a0 / asum; om2 = a2 / asum
-        return om0 * (aterm - 2.0 * bterm + cterm) / 3.0 + (om2 - 0.5) * (bterm - 2.0 * cterm + dterm) / 6.0
+        om0, om2 = _weno_omega_weights(IS0, IS1, IS2, epsilon, tiny)
+        return om0 * (aterm - 2.0 * bterm + cterm) * (1.0 / 3.0) + (om2 - 0.5) * (bterm - 2.0 * cterm + dterm) * (1.0 / 6.0)
 
     def weno_recon_adj(aterm, bterm, cterm, dterm, recon_bar):
         IS0 = 13.0 * (aterm - bterm) ** 2 + 3.0 * (aterm - 3.0 * bterm) ** 2
         IS1 = 13.0 * (bterm - cterm) ** 2 + 3.0 * (bterm + cterm) ** 2
         IS2 = 13.0 * (cterm - dterm) ** 2 + 3.0 * (3.0 * cterm - dterm) ** 2
-        e0 = epsilon + IS0; e1 = epsilon + IS1; e2 = epsilon + IS2
-        a0 = 1.0 / e0 ** 2; a1 = 6.0 / e1 ** 2; a2 = 3.0 / e2 ** 2
-        s3 = a0 + a1 + a2; asum = jnp.maximum(s3, tiny)
-        om0 = a0 / asum; om2 = a2 / asum
-        P0 = (aterm - 2.0 * bterm + cterm) / 3.0
-        P2 = (bterm - 2.0 * cterm + dterm) / 6.0
+        P0 = (aterm - 2.0 * bterm + cterm) * (1.0 / 3.0)
+        P2 = (bterm - 2.0 * cterm + dterm) * (1.0 / 6.0)
         ab = bb = cb = db = 0.0
-        om0_bar = recon_bar * P0; P0_bar = recon_bar * om0
-        om2_bar = recon_bar * P2; P2_bar = recon_bar * (om2 - 0.5)
-        ab += P0_bar / 3.0; bb += -2.0 * P0_bar / 3.0; cb += P0_bar / 3.0
-        bb += P2_bar / 6.0; cb += -2.0 * P2_bar / 6.0; db += P2_bar / 6.0
-        a0_bar = om0_bar / asum; asum_bar = om0_bar * (-a0 / asum ** 2)
-        a2_bar = om2_bar / asum; asum_bar += om2_bar * (-a2 / asum ** 2)
-        s3_bar = jnp.where(s3 > tiny, asum_bar, 0.0)
-        a0_bar += s3_bar; a1_bar = s3_bar; a2_bar += s3_bar
-        IS0_bar = a0_bar * (-2.0) * e0 ** (-3)
-        IS1_bar = a1_bar * 6.0 * (-2.0) * e1 ** (-3)
-        IS2_bar = a2_bar * 3.0 * (-2.0) * e2 ** (-3)
+        om0_bar = recon_bar * P0
+        om2_bar = recon_bar * P2
+        om0, om2, IS0_bar, IS1_bar, IS2_bar = _weno_omega_weights_adjoint(
+            IS0, IS1, IS2, om0_bar, om2_bar, epsilon, tiny
+        )
+        P0_bar = recon_bar * om0
+        P2_bar = recon_bar * (om2 - 0.5)
+        ab += P0_bar * (1.0 / 3.0); bb += -2.0 * P0_bar * (1.0 / 3.0); cb += P0_bar * (1.0 / 3.0)
+        bb += P2_bar * (1.0 / 6.0); cb += -2.0 * P2_bar * (1.0 / 6.0); db += P2_bar * (1.0 / 6.0)
         ab += IS0_bar * (26.0 * (aterm - bterm) + 6.0 * (aterm - 3.0 * bterm))
         bb += IS0_bar * (-26.0 * (aterm - bterm) - 18.0 * (aterm - 3.0 * bterm))
         bb += IS1_bar * (26.0 * (bterm - cterm) + 6.0 * (bterm + cterm))
@@ -904,7 +890,7 @@ def _weno_flux_hydro_pallas_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     local_indices = _hydro_indices_for_axis(config, registered_variables, axis)
@@ -1158,7 +1144,7 @@ def _weno_flux_hydro_pallas_local(
             return amx
 
         flux_acc = [
-            (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) / 12.0
+            (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
             for slot in range(ncomp)
         ]
 
@@ -1188,15 +1174,10 @@ def _weno_flux_hydro_pallas_local(
             IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
             IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
             IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-            alpha0_p = 1.0 / (epsilon + IS0_p) ** 2
-            alpha1_p = 6.0 / (epsilon + IS1_p) ** 2
-            alpha2_p = 3.0 / (epsilon + IS2_p) ** 2
-            alpha_sum_p = jnp.maximum(alpha0_p + alpha1_p + alpha2_p, tiny)
-            omega0_p = alpha0_p / alpha_sum_p
-            omega2_p = alpha2_p / alpha_sum_p
+            omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
             second = (
-                omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) / 3.0
-                + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) / 6.0
+                omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+                + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0)
             )
 
             aterm_m = 0.5 * (d4 - amx * dq4)
@@ -1207,15 +1188,10 @@ def _weno_flux_hydro_pallas_local(
             IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
             IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
             IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-            alpha0_m = 1.0 / (epsilon + IS0_m) ** 2
-            alpha1_m = 6.0 / (epsilon + IS1_m) ** 2
-            alpha2_m = 3.0 / (epsilon + IS2_m) ** 2
-            alpha_sum_m = jnp.maximum(alpha0_m + alpha1_m + alpha2_m, tiny)
-            omega0_m = alpha0_m / alpha_sum_m
-            omega2_m = alpha2_m / alpha_sum_m
+            omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
             third = (
-                omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) / 3.0
-                + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) / 6.0
+                omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+                + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
             )
 
             Fs = -second + third
@@ -1240,7 +1216,7 @@ def _weno_flux_hydro_pallas_local(
         grid=grid,
         in_specs=[in_state_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"hydro_weno_flux_axis_{axis}",
         **kwargs,
     )(
@@ -1318,7 +1294,7 @@ def _weno_flux_hydro_pallas_vjp_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     num_modes = ndim + 2
@@ -1398,7 +1374,7 @@ def _weno_flux_hydro_pallas_vjp_local(
         grid=grid,
         in_specs=[full_spec, full_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=tuple(out_spec for _ in offsets),
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"hydro_weno_flux_vjp_axis_{axis}",
         **kwargs,
     )(
@@ -1443,7 +1419,7 @@ def _mhd_pallas_flux_supported(conserved_state, config: SimulationConfig) -> boo
         return False
     if conserved_state.ndim != 4:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     for n, b in zip(conserved_state.shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -1508,7 +1484,7 @@ def _weno_flux_mhd_pallas(
 
 
 def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
-                              ncomp, num_modes):
+                              ncomp, num_modes, use_approx_rsqrt=False):
     """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
 
     ``q_stencil`` is the tuple ``(q[-2], q[-1], q[0], q[+1], q[+2], q[+3])`` where
@@ -1549,8 +1525,16 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
     # bit-exact with the native flux (which floors the same way).
     sqrt_eps = zero_typed + (1e-30 if jax.config.jax_enable_x64 else 1e-20)
 
+    # ``use_approx_rsqrt`` is a static (Python-bool) build flag, so this is a
+    # trace-time branch, not a runtime one.  When on, sqrt(s) is computed as
+    # ``s * jax.lax.rsqrt(s)`` -> ``rsqrt.approx.f64`` (refined to ~1 ULP by
+    # __nv_rsqrt), ~1.6x cheaper than ``sqrt.rn.f64``'s IEEE expansion and, by
+    # halving spill traffic, ~1.77x on the full dp step (A100).  s is floored
+    # > 0 so ``s * rsqrt(s) == sqrt(s)``.  Forward only: the hand adjoint below
+    # keeps IEEE sqrt (finalize_config warns about the ~1 ULP AD mismatch).
     def ssqrt(x):
-        return jnp.sqrt(jnp.maximum(x, sqrt_eps))
+        s = jnp.maximum(x, sqrt_eps)
+        return s * jax.lax.rsqrt(s) if use_approx_rsqrt else jnp.sqrt(s)
 
     def primitive_from_q(q):
         rho, mn, mt1, mt2, Bn, Bt1, Bt2, energy = q
@@ -1933,7 +1917,7 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
     # First-order centered part (1/12 stencil), one per component.
     flux_acc = [
         (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot]
-         + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) / 12.0
+         + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
         for slot in range(ncomp)
     ]
 
@@ -1956,14 +1940,9 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
         IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
         IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-        alpha0_p = 1.0 / (epsilon + IS0_p) ** 2
-        alpha1_p = 6.0 / (epsilon + IS1_p) ** 2
-        alpha2_p = 3.0 / (epsilon + IS2_p) ** 2
-        alpha_sum_p = jnp.maximum(alpha0_p + alpha1_p + alpha2_p, tiny)
-        omega0_p = alpha0_p / alpha_sum_p
-        omega2_p = alpha2_p / alpha_sum_p
-        second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) / 3.0
-                  + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) / 6.0)
+        omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
+        second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+                  + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0))
 
         aterm_m = 0.5 * (d4 - amx * dq4)
         bterm_m = 0.5 * (d3 - amx * dq3)
@@ -1972,14 +1951,9 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
         IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
         IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-        alpha0_m = 1.0 / (epsilon + IS0_m) ** 2
-        alpha1_m = 6.0 / (epsilon + IS1_m) ** 2
-        alpha2_m = 3.0 / (epsilon + IS2_m) ** 2
-        alpha_sum_m = jnp.maximum(alpha0_m + alpha1_m + alpha2_m, tiny)
-        omega0_m = alpha0_m / alpha_sum_m
-        omega2_m = alpha2_m / alpha_sum_m
-        third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) / 3.0
-                 + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) / 6.0)
+        omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
+        third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+                 + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
         Fs = -second + third
         flux_acc = add_right_correction(flux_acc, mode, Fs)
@@ -2672,33 +2646,25 @@ def _weno_mhd_flux_from_window_adjoint(
         IS0 = 13.0 * (aterm - bterm) ** 2 + 3.0 * (aterm - 3.0 * bterm) ** 2
         IS1 = 13.0 * (bterm - cterm) ** 2 + 3.0 * (bterm + cterm) ** 2
         IS2 = 13.0 * (cterm - dterm) ** 2 + 3.0 * (3.0 * cterm - dterm) ** 2
-        a0 = 1.0 / (epsilon + IS0) ** 2; a1 = 6.0 / (epsilon + IS1) ** 2; a2 = 3.0 / (epsilon + IS2) ** 2
-        asum = jnp.maximum(a0 + a1 + a2, tiny)
-        om0 = a0 / asum; om2 = a2 / asum
-        return om0 * (aterm - 2.0 * bterm + cterm) / 3.0 + (om2 - 0.5) * (bterm - 2.0 * cterm + dterm) / 6.0
+        om0, om2 = _weno_omega_weights(IS0, IS1, IS2, epsilon, tiny)
+        return om0 * (aterm - 2.0 * bterm + cterm) * (1.0 / 3.0) + (om2 - 0.5) * (bterm - 2.0 * cterm + dterm) * (1.0 / 6.0)
 
     def _weno_recon_adj(aterm, bterm, cterm, dterm, recon_bar):
         IS0 = 13.0 * (aterm - bterm) ** 2 + 3.0 * (aterm - 3.0 * bterm) ** 2
         IS1 = 13.0 * (bterm - cterm) ** 2 + 3.0 * (bterm + cterm) ** 2
         IS2 = 13.0 * (cterm - dterm) ** 2 + 3.0 * (3.0 * cterm - dterm) ** 2
-        e0 = epsilon + IS0; e1 = epsilon + IS1; e2 = epsilon + IS2
-        a0 = 1.0 / e0 ** 2; a1 = 6.0 / e1 ** 2; a2 = 3.0 / e2 ** 2
-        s3 = a0 + a1 + a2; asum = jnp.maximum(s3, tiny)
-        om0 = a0 / asum; om2 = a2 / asum
-        P0 = (aterm - 2.0 * bterm + cterm) / 3.0
-        P2 = (bterm - 2.0 * cterm + dterm) / 6.0
+        P0 = (aterm - 2.0 * bterm + cterm) * (1.0 / 3.0)
+        P2 = (bterm - 2.0 * cterm + dterm) * (1.0 / 6.0)
         ab = bb = cb = db = 0.0
-        om0_bar = recon_bar * P0; P0_bar = recon_bar * om0
-        om2_bar = recon_bar * P2; P2_bar = recon_bar * (om2 - 0.5)
-        ab += P0_bar / 3.0; bb += -2.0 * P0_bar / 3.0; cb += P0_bar / 3.0
-        bb += P2_bar / 6.0; cb += -2.0 * P2_bar / 6.0; db += P2_bar / 6.0
-        a0_bar = om0_bar / asum; asum_bar = om0_bar * (-a0 / asum ** 2)
-        a2_bar = om2_bar / asum; asum_bar += om2_bar * (-a2 / asum ** 2)
-        s3_bar = jnp.where(s3 > tiny, asum_bar, 0.0)
-        a0_bar += s3_bar; a1_bar = s3_bar; a2_bar += s3_bar
-        IS0_bar = a0_bar * (-2.0) * e0 ** (-3)
-        IS1_bar = a1_bar * 6.0 * (-2.0) * e1 ** (-3)
-        IS2_bar = a2_bar * 3.0 * (-2.0) * e2 ** (-3)
+        om0_bar = recon_bar * P0
+        om2_bar = recon_bar * P2
+        om0, om2, IS0_bar, IS1_bar, IS2_bar = _weno_omega_weights_adjoint(
+            IS0, IS1, IS2, om0_bar, om2_bar, epsilon, tiny
+        )
+        P0_bar = recon_bar * om0
+        P2_bar = recon_bar * (om2 - 0.5)
+        ab += P0_bar * (1.0 / 3.0); bb += -2.0 * P0_bar * (1.0 / 3.0); cb += P0_bar * (1.0 / 3.0)
+        bb += P2_bar * (1.0 / 6.0); cb += -2.0 * P2_bar * (1.0 / 6.0); db += P2_bar * (1.0 / 6.0)
         ab += IS0_bar * (26.0 * (aterm - bterm) + 6.0 * (aterm - 3.0 * bterm))
         bb += IS0_bar * (-26.0 * (aterm - bterm) - 18.0 * (aterm - 3.0 * bterm))
         bb += IS1_bar * (26.0 * (bterm - cterm) + 6.0 * (bterm + cterm))
@@ -3223,7 +3189,7 @@ def _weno_flux_mhd_pallas_local(
     nvars = int(conserved_state.shape[0])
     spatial_shape = tuple(int(x) for x in conserved_state.shape[1:])
     nx, ny, nz = spatial_shape
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     local_indices = _mhd_indices_for_axis(config, registered_variables, axis)
@@ -3244,7 +3210,8 @@ def _weno_flux_mhd_pallas_local(
     b_eps_value = 1e-20
     sqrt_floor_value = 1e-12
 
-    def kernel(q_ref, gamma_ref, rhomin_ref, pgmin_ref, b_eps_ref, sqrt_floor_ref, flux_out_ref):
+    def kernel(q_ref, gamma_ref, rhomin_ref, pgmin_ref, b_eps_ref,
+               sqrt_floor_ref, flux_out_ref):
         bi = pl.program_id(0)
         bj = pl.program_id(1)
         bk = pl.program_id(2)
@@ -3275,8 +3242,11 @@ def _weno_flux_mhd_pallas_local(
             return tuple(q_at(idx, offset) for idx in local_indices)
 
         q_stencil = tuple(q_local(off) for off in range(-2, 4))     # offsets -2..3
+
         flux_acc = _weno_mhd_flux_from_window(
-            q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor, ncomp, num_modes
+            q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
+            ncomp, num_modes,
+            use_approx_rsqrt=config.backend_config.use_approximate_rsqrt,
         )
 
         # Write every output component.  Hydro/MHD covers all conserved
@@ -3293,23 +3263,27 @@ def _weno_flux_mhd_pallas_local(
     if compiler_params is not None:
         kwargs["compiler_params"] = compiler_params
 
-    return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct(conserved_state.shape, conserved_state.dtype),
-        grid=grid,
-        in_specs=[in_state_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec],
-        out_specs=out_spec,
-        interpret=config.pallas_interpret,
-        name=f"mhd_weno_flux_axis_{axis}",
-        **kwargs,
-    )(
-        conserved_state,
+    out_shape = jax.ShapeDtypeStruct(conserved_state.shape, conserved_state.dtype)
+    scalars = (
         jnp.asarray(params.gamma, dtype=conserved_state.dtype),
         jnp.asarray(params.minimum_density, dtype=conserved_state.dtype),
         jnp.asarray(params.minimum_pressure, dtype=conserved_state.dtype),
         jnp.asarray(b_eps_value, dtype=conserved_state.dtype),
         jnp.asarray(sqrt_floor_value, dtype=conserved_state.dtype),
     )
+
+    flux = pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[in_state_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name=f"mhd_weno_flux_axis_{axis}",
+        **kwargs,
+    )(conserved_state, *scalars)
+
+    return flux
 
 
 def _weno_flux_mhd_pallas_vjp_local(
@@ -3369,7 +3343,7 @@ def _weno_flux_mhd_pallas_vjp_local(
     nvars = int(cs.shape[0])
     spatial_shape = tuple(int(x) for x in cs.shape[1:])
     nx, ny, nz = spatial_shape
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     offsets = tuple(range(-2, 4))  # WENO5 stencil window
@@ -3456,7 +3430,7 @@ def _weno_flux_mhd_pallas_vjp_local(
         in_specs=[full_spec, full_spec, scalar_spec, scalar_spec, scalar_spec,
                   scalar_spec, scalar_spec],
         out_specs=tuple(out_spec for _ in offsets),
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"mhd_weno_flux_vjp_axis_{axis}",
         **kwargs,
     )(
@@ -3503,7 +3477,7 @@ def _mhd_iso_pallas_flux_supported(conserved_state, config: SimulationConfig) ->
         return False
     if conserved_state.ndim != 4:
         return False
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     for n, b in zip(conserved_state.shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -3583,7 +3557,7 @@ def _weno_flux_mhd_iso_pallas_local(
     nvars = int(conserved_state.shape[0])
     spatial_shape = tuple(int(x) for x in conserved_state.shape[1:])
     nx, ny, nz = spatial_shape
-    bx_, by_, bz_ = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx_, by_, bz_ = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx_, ny // by_, nz // bz_)
 
     local_indices = _mhd_iso_indices_for_axis(config, registered_variables, axis)
@@ -3896,7 +3870,7 @@ def _weno_flux_mhd_iso_pallas_local(
 
         flux_acc = [
             (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot]
-             + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) / 12.0
+             + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
             for slot in range(ncomp)
         ]
 
@@ -3917,28 +3891,18 @@ def _weno_flux_mhd_iso_pallas_local(
             IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
             IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
             IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-            alpha0_p = 1.0 / (epsilon + IS0_p) ** 2
-            alpha1_p = 6.0 / (epsilon + IS1_p) ** 2
-            alpha2_p = 3.0 / (epsilon + IS2_p) ** 2
-            alpha_sum_p = jnp.maximum(alpha0_p + alpha1_p + alpha2_p, tiny)
-            omega0_p = alpha0_p / alpha_sum_p
-            omega2_p = alpha2_p / alpha_sum_p
-            second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) / 3.0
-                      + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) / 6.0)
+            omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
+            second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+                      + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0))
 
             aterm_m = 0.5 * (d4 - amx * dq4); bterm_m = 0.5 * (d3 - amx * dq3)
             cterm_m = 0.5 * (d2 - amx * dq2); dterm_m = 0.5 * (d1 - amx * dq1)
             IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
             IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
             IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-            alpha0_m = 1.0 / (epsilon + IS0_m) ** 2
-            alpha1_m = 6.0 / (epsilon + IS1_m) ** 2
-            alpha2_m = 3.0 / (epsilon + IS2_m) ** 2
-            alpha_sum_m = jnp.maximum(alpha0_m + alpha1_m + alpha2_m, tiny)
-            omega0_m = alpha0_m / alpha_sum_m
-            omega2_m = alpha2_m / alpha_sum_m
-            third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) / 3.0
-                     + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) / 6.0)
+            omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
+            third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+                     + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
             Fs = -second + third
             flux_acc = add_right_correction(flux_acc, mode, Fs)
@@ -3960,7 +3924,7 @@ def _weno_flux_mhd_iso_pallas_local(
         grid=grid,
         in_specs=[in_state_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"mhd_iso_weno_flux_axis_{axis}",
         **kwargs,
     )(
@@ -4014,7 +3978,7 @@ def _weno_flux_hydro_pallas_rhs(
         )
 
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     halo_list = [0, 0, 0]
     if 0 <= int(axis) < ndim:
         halo_list[int(axis)] = 3
@@ -4065,7 +4029,7 @@ def _weno_flux_hydro_pallas_rhs_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     local_indices = _hydro_indices_for_axis(config, registered_variables, axis)
@@ -4333,7 +4297,7 @@ def _weno_flux_hydro_pallas_rhs_local(
                     + 7.0 * f_stencil[3][slot]
                     - f_stencil[4][slot]
                 )
-                / 12.0
+                * (1.0 / 12.0)
                 for slot in range(ncomp)
             ]
 
@@ -4363,15 +4327,10 @@ def _weno_flux_hydro_pallas_rhs_local(
                 IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
                 IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
                 IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-                alpha0_p = 1.0 / (epsilon + IS0_p) ** 2
-                alpha1_p = 6.0 / (epsilon + IS1_p) ** 2
-                alpha2_p = 3.0 / (epsilon + IS2_p) ** 2
-                alpha_sum_p = jnp.maximum(alpha0_p + alpha1_p + alpha2_p, tiny)
-                omega0_p = alpha0_p / alpha_sum_p
-                omega2_p = alpha2_p / alpha_sum_p
+                omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
                 second = (
-                    omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) / 3.0
-                    + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) / 6.0
+                    omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+                    + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0)
                 )
 
                 aterm_m = 0.5 * (d4 - amx * dq4)
@@ -4382,15 +4341,10 @@ def _weno_flux_hydro_pallas_rhs_local(
                 IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
                 IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
                 IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-                alpha0_m = 1.0 / (epsilon + IS0_m) ** 2
-                alpha1_m = 6.0 / (epsilon + IS1_m) ** 2
-                alpha2_m = 3.0 / (epsilon + IS2_m) ** 2
-                alpha_sum_m = jnp.maximum(alpha0_m + alpha1_m + alpha2_m, tiny)
-                omega0_m = alpha0_m / alpha_sum_m
-                omega2_m = alpha2_m / alpha_sum_m
+                omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
                 third = (
-                    omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) / 3.0
-                    + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) / 6.0
+                    omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+                    + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
                 )
 
                 Fs = -second + third
@@ -4458,7 +4412,7 @@ def _weno_flux_hydro_pallas_rhs_local(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"hydro_weno_rhs_axis_{axis}",
         **kwargs,
     )(*kernel_args)

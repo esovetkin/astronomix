@@ -52,6 +52,7 @@ from astronomix import (
     SimulationConfig,
     SimulationParams,
     BoundarySettings1D,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -117,8 +118,10 @@ def simulate(solver_mode, riemann_solver, num_cells):
         dimensionality=1,
         mhd=False,
         # FD/WENO uses the Pallas backend (bit-compatible with native JAX).
-        backend=PALLAS if is_finite_difference else NATIVE_JAX,
-        pallas_block_shape=(4, 1, 1),
+        backend_config=BackendConfig(
+            backend=PALLAS if is_finite_difference else NATIVE_JAX,
+            pallas_block_shape=(4, 1, 1),
+        ),
     )
 
     helper_data = get_helper_data(config)

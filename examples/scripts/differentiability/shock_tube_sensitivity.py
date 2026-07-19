@@ -74,6 +74,7 @@ from astronomix import (
     SimulationConfig,
     BoundarySettings1D,
     SimulationParams,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -114,8 +115,10 @@ def make_config_and_params(N, L, t_end, num_timesteps, solver_mode, backend=NATI
         geometry=CARTESIAN,
         progress_bar=False,
         differentiation_mode=BACKWARDS,
-        backend=backend,
-        pallas_block_shape=(4, 1, 1),
+        backend_config=BackendConfig(
+            backend=backend,
+            pallas_block_shape=(4, 1, 1),
+        ),
         mhd=False,
         dimensionality=1,
         box_size=L,

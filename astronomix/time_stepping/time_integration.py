@@ -152,9 +152,9 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
                     "  - set config.time_integrator = RK4_LSRK, the 2N-storage "
                     "low-memory RK4 integrator (one fewer full-state buffer)."
                 )
-            if config.backend != PALLAS:
+            if config.backend_config.backend != PALLAS:
                 hints.append(
-                    "  - set config.backend = PALLAS (or OPTIMAL_BACKEND on an "
+                    "  - set config.backend_config.backend = PALLAS (or OPTIMAL_BACKEND on an "
                     "Ampere+ GPU); its fused kernels need far less temporary "
                     "memory than the native-JAX backend."
                 )

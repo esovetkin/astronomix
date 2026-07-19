@@ -90,6 +90,7 @@ from astronomix.option_classes.simulation_config import (  # noqa: E402
     RK4_LSRK,
     SimulationConfig,
     SnapshotSettings,
+    BackendConfig,
 )
 from astronomix.test_setups.hydrodynamics.sound_wave3D import (  # noqa: E402
     SoundWave3DSettings,
@@ -117,12 +118,14 @@ BOX = (float(GLOBAL[0]), float(GLOBAL[1]), float(GLOBAL[2]))
 
 # A memory-lean FD/Pallas config; LSRK4 + donate keep the per-GPU footprint low.
 base_config = SimulationConfig(
-    backend=PALLAS,
+    backend_config=BackendConfig(
+        backend=PALLAS,
+        pallas_block_shape=_BLOCK,
+        pallas_use_triton=True,
+        pallas_interpret=False,
+    ),
     solver_mode=FINITE_DIFFERENCE,
     time_integrator=RK4_LSRK,
-    pallas_block_shape=_BLOCK,
-    pallas_use_triton=True,
-    pallas_interpret=False,
     mhd=False,
     dimensionality=3,
     donate_state=True,

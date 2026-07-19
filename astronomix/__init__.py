@@ -39,6 +39,7 @@ from astronomix.option_classes.simulation_config import (
     SnapshotSettings,
     PositivityConfig,
     GravityConfig,
+    BackendConfig,
 )
 from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix._modules._stellar_wind.stellar_wind_options import WindParams

@@ -17,7 +17,7 @@ tests
 data_mhdgrav
 
 # regenerated methods-paper outputs (see pytests/paper_plots)
-pytests/paper_plots/**/figures/
+# pytests/paper_plots/**/figures/
 pytests/paper_plots/**/data/
 
 TODO.md
@@ -209,25 +209,14 @@ cython_debug/
 # (directories are kept in git via their .gitkeep placeholders)
 examples/scripts/**/data/
 examples/gallery/**/data/
-examples/scripts/**/figures/*
+# examples/scripts/**/figures/*
 !examples/scripts/**/figures/.gitkeep
-examples/gallery/**/figures/*
+# examples/gallery/**/figures/*
 !examples/gallery/**/figures/.gitkeep
-pytests/**/figures/*
+# pytests/**/figures/*
 !pytests/**/figures/.gitkeep
 
 examples/notebooks/differentiability/frames
-
-# generated example/test outputs: simulation caches + figures
-# (directories are kept in git via their .gitkeep placeholders)
-examples/scripts/**/data/
-examples/gallery/**/data/
-examples/scripts/**/figures/*
-!examples/scripts/**/figures/.gitkeep
-examples/gallery/**/figures/*
-!examples/gallery/**/figures/.gitkeep
-pytests/**/figures/*
-!pytests/**/figures/.gitkeep
 
 # field_level_inference generated outputs (logo.png is the tracked input target)
 examples/scripts/differentiability/field_level_inference/panel_snaps.npz

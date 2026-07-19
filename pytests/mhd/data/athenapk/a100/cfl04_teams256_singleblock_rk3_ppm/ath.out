@@ -1,0 +1,24 @@
+AthenaPK CP Alfvén wave convergence
+  binary    : /workspace/athenapk/build-hopper-a100-double/bin/athenaPK
+  input file: /workspace/run/cpaw/cfl04_teams256_singleblock/cpaw_convergence.in
+  N values  : [8, 16, 32, 64, 128]  (grids: ['16×8×8', '32×16×16', '64×32×32', '128×64×64', '256×128×128'])
+  t_end=5.0, CFL=0.4, VL2+PLM+HLLD, GLM-MHD
+
+  N=   8  grid=16×8×8  meshblock=(16, 8, 8)  →  L1=1.658e-02  t=0.14s  Ncycle=78
+  N=  16  grid=32×16×16  meshblock=(32, 16, 16)  →  L1=1.294e-03  t=0.46s  Ncycle=157
+  N=  32  grid=64×32×32  meshblock=(64, 32, 32)  →  L1=2.110e-04  t=1.84s  Ncycle=314
+  N=  64  grid=128×64×64  meshblock=(128, 64, 64)  →  L1=4.384e-05  t=11.87s  Ncycle=627
+  N= 128  grid=256×128×128  meshblock=(256, 128, 128)  →  L1=1.058e-05  t=91.00s  Ncycle=1254
+
+Saved to ./
+  athenapk_alfven_N_values.npy
+  athenapk_alfven_errors.npy
+  athenapk_alfven_runtimes.npy
+  athenapk_alfven_iterations.npy
+  athenapk_alfven_convergence.npz
+
+Convergence rates (log-log slope between consecutive resolutions):
+  N=  8 →  16: -3.68  (expect ≈ -2 for PLM/VL2)
+  N= 16 →  32: -2.62  (expect ≈ -2 for PLM/VL2)
+  N= 32 →  64: -2.27  (expect ≈ -2 for PLM/VL2)
+  N= 64 → 128: -2.05  (expect ≈ -2 for PLM/VL2)

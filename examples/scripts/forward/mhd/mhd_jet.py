@@ -61,7 +61,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, NamedSharding
 
 # astronomix constants
-from astronomix import OPEN_BOUNDARY
+from astronomix import PERIODIC_BOUNDARY
 from astronomix.option_classes.simulation_config import (
     RK4_LSRK,
     RK4_SSP,
@@ -78,6 +78,7 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     PositivityConfig,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -142,7 +143,9 @@ def simulate(num_cells):
     center = BOX_SIZE / 2.0
 
     config = SimulationConfig(
-        positivity_config=PositivityConfig(default_positivity_protection=True),
+        positivity_config=PositivityConfig(
+            default_positivity_protection=False,
+        ),
         # FD/WENO runs ~10x faster through the Pallas (Triton) backend;
         # bit-compatible with native JAX.
         grid_spacing=grid_spacing,
@@ -152,9 +155,9 @@ def simulate(num_cells):
         box_size=BOX_SIZE,
         num_cells=num_cells,
         boundary_settings=BoundarySettings(
-            BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY),
-            BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY),
-            BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY),
+            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
         ),
         # Memory savers are enabled only for the multi-GPU (high-resolution)
         # path so the single-GPU run reproduces the paper's 256^3 figure
@@ -167,7 +170,9 @@ def simulate(num_cells):
         # Optional smaller Pallas block shape (``--block bx,by,bz``): a
         # numerics-preserving lever to shave peak device memory (smaller halo
         # padding + tile temporaries). ``None`` keeps the astronomix default.
-        pallas_block_shape=BLOCK_SHAPE,
+        backend_config=BackendConfig(
+            pallas_block_shape=BLOCK_SHAPE,
+        ),
     )
     rv = get_registered_variables(config)
 
@@ -254,8 +259,8 @@ def simulate(num_cells):
         dt_max=0.1,
         t_end=T_END,
         gamma=GAMMA,
-        minimum_density=1e-2 * RHO_0,
-        minimum_pressure=1e-2 * P_0,
+        minimum_density=1e-4 * RHO_0,
+        minimum_pressure=1e-4 * P_0,
     )
 
     config = finalize_config(config, initial_state.shape)
@@ -315,16 +320,23 @@ def plot(num_cells, rerun):
         extent=(0, BOX_SIZE, 0, BOX_SIZE),
         cmap="YlOrRd",
     )
-    ax.set_xlabel("x")
-    ax.set_ylabel("z")
     ax.set_aspect("equal", adjustable="box")
+    # Bare density panel: no axis labels or tick numbers.
+    ax.set_xticks([])
+    ax.set_yticks([])
     cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.05)
     fig.colorbar(image, cax=cax, label="density")
 
     plt.tight_layout()
+    # High raster resolution so the density panel stays crisp — including the
+    # imshow embedded (rasterized) inside the PDF/SVG vector outputs, which
+    # otherwise defaults to the figure's ~100 dpi.
+    dpi = 600
     out = FIG_DIR / f"mhd_jet_fd_{num_cells}.png"
-    fig.savefig(out, dpi=300)
-    fig.savefig(out.with_suffix(".pdf"))
+    fig.savefig(out, dpi=dpi)
+    # Vector outputs cropped tight to the drawn content (panel + colorbar).
+    for suffix in (".pdf", ".svg"):
+        fig.savefig(out.with_suffix(suffix), dpi=dpi, bbox_inches="tight", pad_inches=0)
     plt.close(fig)
     print(f"saved {out}")
 

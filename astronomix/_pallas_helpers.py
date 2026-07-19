@@ -2,7 +2,7 @@
 
 This module is the single place that:
 - imports Pallas / Triton (and exposes ``pl is None`` if unavailable),
-- normalises ``config.pallas_block_shape`` to a 3-tuple,
+- normalises ``config.backend_config.pallas_block_shape`` to a 3-tuple,
 - builds Triton ``CompilerParams`` from config knobs,
 - exposes the ``backend == PALLAS`` predicate,
 - provides the ``_pallas_call_sharded`` multi-GPU wrapper that turns an
@@ -41,26 +41,39 @@ except Exception:  # pragma: no cover - Triton GPU backend optional
 
 def _backend_is_pallas(config: SimulationConfig) -> bool:
     """Return whether the configured backend is the Pallas/Triton GPU backend."""
-    return config.backend == PALLAS
+    return config.backend_config.backend == PALLAS
 
 
 def _default_pallas_block_shape(ndim: int) -> tuple[int, int, int]:
     """Return the default Pallas block shape ``(bx, by, bz)`` for ``ndim`` spatial
-    dimensions (inactive dimensions forced to 1)."""
+    dimensions (inactive dimensions forced to 1).
+
+    The 3D default (2, 2, 32) keeps one element per thread at the default
+    ``num_warps=4`` (128-cell blocks) with a 256-byte-contiguous fast axis:
+    on an A100 this ran the dp MHD WENO kernel ~10% faster end-to-end than
+    the previous (4, 4, 8) at identical results (2026-07 Alfvén-wave sweep;
+    128-cell blocks with longer z-rows all tie within noise, larger or
+    smaller blocks register-spill or idle threads)."""
     if ndim == 1:
         return (128, 1, 1)
     if ndim == 2:
         return (16, 16, 1)
-    return (4, 4, 8)
+    return (2, 2, 32)
 
 
-def _as_3tuple_block_shape(block_shape, ndim: int) -> tuple[int, int, int]:
+def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[int, int, int]:
     """Normalise whatever the user supplied (None / str / tuple) to
     ``(bx, by, bz)`` with the inactive dims forced to 1.  Pallas grid
-    construction depends on this tuple being canonical."""
+    construction depends on this tuple being canonical.
+
+    When ``spatial_shape`` is given, each active block dimension is clamped
+    to its grid extent, so a default tuned for production grids (e.g. bz=32)
+    stays a valid tiling on small grids (bz -> nz) instead of tripping the
+    grid-divisibility support predicates and silently dropping the whole run
+    to the native backend."""
     if block_shape is None:
-        return _default_pallas_block_shape(ndim)
-    if isinstance(block_shape, str):
+        parts = _default_pallas_block_shape(ndim)
+    elif isinstance(block_shape, str):
         parts = tuple(int(p.strip()) for p in block_shape.split(",") if p.strip())
     else:
         parts = tuple(int(x) for x in block_shape)
@@ -73,19 +86,24 @@ def _as_3tuple_block_shape(block_shape, ndim: int) -> tuple[int, int, int]:
     else:
         parts = _default_pallas_block_shape(ndim)
     if ndim == 1:
-        return (parts[0], 1, 1)
-    if ndim == 2:
-        return (parts[0], parts[1], 1)
+        parts = (parts[0], 1, 1)
+    elif ndim == 2:
+        parts = (parts[0], parts[1], 1)
+    if spatial_shape is not None:
+        parts = tuple(
+            min(int(b), int(n)) for b, n in zip(parts, tuple(spatial_shape) + (1, 1))
+        )[:3]
+        parts = tuple(parts) + (1,) * (3 - len(parts))
     return parts
 
 
 def _pallas_compiler_params(config: SimulationConfig):
     """Return Triton ``CompilerParams`` (or None if the Triton backend is
     not available / the user opted out via ``pallas_use_triton=False``)."""
-    use_triton = config.pallas_use_triton
+    use_triton = config.backend_config.pallas_use_triton
     if use_triton and pltriton is not None:
         return pltriton.CompilerParams(
-            num_warps=config.pallas_num_warps,
+            num_warps=config.backend_config.pallas_num_warps,
         )
     return None
 

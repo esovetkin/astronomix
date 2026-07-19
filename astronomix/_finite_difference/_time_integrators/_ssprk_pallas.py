@@ -72,7 +72,7 @@ def _div_axis_pallas_shape_ok(state, config: SimulationConfig) -> bool:
         return False
     if state.ndim != ndim + 1:
         return False
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state.shape[1:])
     for n, b in zip(state.shape[1:], (bx, by, bz)[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -113,7 +113,7 @@ def _hydro_flux_div_axis_pallas(
     # same wrapper to keep the input_output_aliases trick intact inside
     # each shard.
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=dF.shape[1:])
     halo_list = [0, 0, 0]
     if 0 <= axis < ndim:
         halo_list[axis] = 1
@@ -198,7 +198,7 @@ def _hydro_flux_div_axis_pallas_local(
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
     grid = (nx // bx, ny // by, nz // bz)
 
     accumulate = rhs_accumulator is not None
@@ -284,7 +284,7 @@ def _hydro_flux_div_axis_pallas_local(
         grid=grid,
         in_specs=in_specs,
         out_specs=out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name=f"hydro_flux_div_axis_{axis}{'_acc' if accumulate else ''}",
         **kwargs,
     )(*kernel_args)

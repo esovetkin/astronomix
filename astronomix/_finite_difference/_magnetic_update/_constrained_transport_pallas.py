@@ -63,7 +63,7 @@ ZAXIS = 2
 def _ct_pallas_block_ok(state_shape, config: SimulationConfig) -> bool:
     """Spatial-block divisibility check shared by all CT kernels."""
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.pallas_block_shape, ndim)
+    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state_shape[1:])
     for n, b in zip(state_shape[1:], block_shape[:ndim], strict=True):
         if int(n) % int(b) != 0:
             return False
@@ -88,7 +88,7 @@ def _ct_update_cell_center_fields_pallas_supported(state, config: SimulationConf
         return False
     if not _backend_is_pallas(config):
         return False
-    if not config.pallas_ct:
+    if not config.backend_config.pallas_ct:
         return False
     if not config.mhd:
         return False
@@ -116,7 +116,7 @@ def _ct_update_cell_center_fields_pallas(
     assert _ct_update_cell_center_fields_pallas_supported(conserved_state, config)
     nvars = int(conserved_state.shape[0])
     nx, ny, nz = (int(x) for x in conserved_state.shape[1:])
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, 3)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, 3, spatial_shape=(nx, ny, nz))
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     BX = int(registered_variables.magnetic_index.x)
@@ -205,7 +205,7 @@ def _ct_update_cell_center_fields_pallas(
         grid=grid,
         in_specs=[state_in_spec, b_in_spec, b_in_spec, b_in_spec],
         out_specs=state_out_spec,
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="ct_update_cell_center_fields",
         **kwargs,
     )(conserved_state, bx_interface, by_interface, bz_interface)
@@ -218,14 +218,14 @@ def _ct_update_cell_center_fields_pallas(
 
 def _ct_rhs_pallas_supported(state, config: SimulationConfig) -> bool:
     """Whether the staged Pallas CT-RHS path can run (3D only).  Gated
-    on ``config.pallas_ct`` (default off): the staged kernel chain is
+    on ``config.backend_config.pallas_ct`` (default off): the staged kernel chain is
     correct and stable but adds ~25 s of one-time compile cost while
     giving only marginal memory savings at production grid sizes."""
     if pl is None:
         return False
     if not _backend_is_pallas(config):
         return False
-    if not config.pallas_ct:
+    if not config.backend_config.pallas_ct:
         return False
     if not config.mhd:
         return False
@@ -262,7 +262,7 @@ def _ct_modified_flux_pallas(
     Worst-case stencil halo: 2 along each axis (independent per output).
     """
     nx, ny, nz = (int(x) for x in conserved_state.shape[1:])
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, 3)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, 3, spatial_shape=(nx, ny, nz))
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     DENSITY = int(registered_variables.density_index)
@@ -339,7 +339,7 @@ def _ct_modified_flux_pallas(
         grid=grid,
         in_specs=[state_spec] + [field_in_spec] * 6,
         out_specs=tuple(out_spec for _ in range(6)),
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="ct_modified_flux",
         **kwargs,
     )(
@@ -366,7 +366,7 @@ def _ct_edge_emf_pallas(
     (one per input).  Halo: 2 per axis.
     """
     nx, ny, nz = (int(x) for x in By_flux_x_mod.shape)
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, 3)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, 3, spatial_shape=(nx, ny, nz))
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     field_spec = pl.BlockSpec(By_flux_x_mod.shape, lambda bi, bj, bk: (0, 0, 0))
@@ -425,7 +425,7 @@ def _ct_edge_emf_pallas(
         grid=grid,
         in_specs=[field_spec] * 6,
         out_specs=tuple(out_spec for _ in range(3)),
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="ct_edge_emf",
         **kwargs,
     )(
@@ -449,7 +449,7 @@ def _ct_curl_pallas(
     therefore ≤ 4, well inside Triton's comfort zone.
     """
     nx, ny, nz = (int(x) for x in Omega_z_edge.shape)
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.pallas_block_shape, 3)
+    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, 3, spatial_shape=(nx, ny, nz))
     grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
 
     field_spec = pl.BlockSpec(Omega_z_edge.shape, lambda bi, bj, bk: (0, 0, 0))
@@ -563,7 +563,7 @@ def _ct_curl_pallas(
         in_specs=[field_spec, field_spec, field_spec,
                   scalar_spec, scalar_spec, scalar_spec],
         out_specs=tuple(out_spec for _ in range(3)),
-        interpret=config.pallas_interpret,
+        interpret=config.backend_config.pallas_interpret,
         name="ct_curl",
         **kwargs,
     )(

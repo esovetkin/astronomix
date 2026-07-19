@@ -43,6 +43,7 @@ from astronomix import (
     GravityConfig,
     PositivityConfig,
     SimulationParams,
+    BackendConfig,
 )
 from astronomix.option_classes.simulation_config import (
     StaticFloatVector,
@@ -392,7 +393,7 @@ def run_adjoint_test(dim, ic_type, compare_backends=False):
         for lab, sm, be, _st in grad_backend_specs:
             cfg_b, params_b = get_config_and_params(dim, N, L, t_end, solver_mode=sm)
             if be == PALLAS:
-                cfg_b = cfg_b._replace(backend=PALLAS, pallas_use_triton=True, pallas_interpret=False)
+                cfg_b = cfg_b._replace(backend_config=cfg_b.backend_config._replace(backend=PALLAS, pallas_use_triton=True, pallas_interpret=False))
             ad_grads_by_backend[lab] = get_ad_gradients(rho_P0, v_P0, cfg_b, params_b, rho_B, c_s, P_B)
         ad_grad_rho, ad_grad_v = ad_grads_by_backend[grad_backend_specs[0][0]]
     else:
@@ -548,10 +549,12 @@ def run_gradient_convergence_test():
                 while bx * 2 <= min(N, 128) and N % (bx * 2) == 0:
                     bx *= 2
                 config = config._replace(
-                    backend=PALLAS,
-                    pallas_block_shape=(bx, 1, 1),
-                    pallas_interpret=False,
-                    pallas_use_triton=True,
+                    backend_config=config.backend_config._replace(
+                        backend=PALLAS,
+                        pallas_block_shape=(bx, 1, 1),
+                        pallas_interpret=False,
+                        pallas_use_triton=True,
+                    )
                 )
             helper_data = get_helper_data(config)
 

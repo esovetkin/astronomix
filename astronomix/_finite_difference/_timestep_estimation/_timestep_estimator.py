@@ -56,7 +56,7 @@ def _mhd_fast_cfl_supported(config: SimulationConfig, registered_variables: Regi
     full-state characteristic-eigenvalue intermediate.  Available
     whenever the Pallas backend is on and the registry exposes the
     velocity/magnetic indices."""
-    if config.backend != PALLAS:
+    if config.backend_config.backend != PALLAS:
         return False
     if not config.mhd:
         return False
@@ -449,7 +449,7 @@ def _cfl_time_step_fd_hydro_native(
 def _backend_name(config: SimulationConfig) -> str:
     """Return the configured backend name as an upper-case string, tolerating
     both enum-like (``.name`` / ``.value``) and plain values."""
-    backend = config.backend
+    backend = config.backend_config.backend
     name = getattr(backend, "name", None)
     if name is not None:
         return str(name).upper()
@@ -461,7 +461,7 @@ def _backend_name(config: SimulationConfig) -> str:
 
 def _backend_is_pallas(config: SimulationConfig) -> bool:
     """Whether the Pallas backend is selected."""
-    return config.backend == PALLAS
+    return config.backend_config.backend == PALLAS
 
 
 def _hydro_fast_cfl_supported(config: SimulationConfig, registered_variables: RegisteredVariables) -> bool:

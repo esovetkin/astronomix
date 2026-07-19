@@ -69,6 +69,7 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     PositivityConfig,
+    BackendConfig,
 )
 from astronomix._modules._turbulent_forcing._turbulent_forcing_options import TurbulentForcingConfig
 
@@ -106,7 +107,7 @@ def main():
 
     backend_kw = {}
     if args.backend == "pallas":
-        backend_kw = dict(backend=PALLAS)
+        backend_kw = dict(backend_config=BackendConfig(backend=PALLAS))
 
     config = SimulationConfig(
         positivity_config=PositivityConfig(default_positivity_protection=True),

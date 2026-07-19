@@ -64,6 +64,7 @@ from astronomix import (
     BoundarySettings1D,
     SimulationConfig,
     SimulationParams,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -172,7 +173,7 @@ def _base_config(problem: _Problem, solver_mode: int, backend: int = NATIVE_JAX)
             right_boundary=PERIODIC_BOUNDARY,
         ),
         return_snapshots=False,
-        backend=backend,
+        backend_config=BackendConfig(backend=backend),
     )
     params = SimulationParams(
         C_cfl=0.4,

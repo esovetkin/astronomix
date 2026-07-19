@@ -111,6 +111,7 @@ def _benchmark_and_setup(physics):
         SimulationConfig,
         SnapshotSettings,
         StaticFloatVector,
+        BackendConfig,
     )
 
     common = dict(
@@ -123,10 +124,12 @@ def _benchmark_and_setup(physics):
         snapshot_settings=SnapshotSettings(return_final_state=True),
     )
     fd_pallas = dict(
-        backend=PALLAS,
-        pallas_block_shape=(4, 4, 8),
-        pallas_use_triton=True,
-        pallas_interpret=False,
+        backend_config=BackendConfig(
+            backend=PALLAS,
+            pallas_block_shape=(4, 4, 8),
+            pallas_use_triton=True,
+            pallas_interpret=False,
+        ),
         solver_mode=FINITE_DIFFERENCE,
     )
 

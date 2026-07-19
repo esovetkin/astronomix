@@ -82,6 +82,7 @@ from astronomix.option_classes.simulation_config import (  # noqa: E402
     SimulationConfig,
     SnapshotSettings,
     StaticFloatVector,
+    BackendConfig,
 )
 from astronomix.test_setups.hydrodynamics.sound_wave3D import setup_sound_wave  # noqa: E402
 from astronomix.test_setups.mhd.alfven_wave3D import setup_cp_alfven_wave  # noqa: E402
@@ -122,20 +123,23 @@ _snap = dict(
 
 
 def _fv(**extra):
-    return SimulationConfig(backend=NATIVE_JAX, solver_mode=FINITE_VOLUME, **_snap, **extra)
+    return SimulationConfig(backend_config=BackendConfig(backend=NATIVE_JAX), solver_mode=FINITE_VOLUME, **_snap, **extra)
 
 
 def _fd_jax(**extra):
     return SimulationConfig(
-        backend=NATIVE_JAX, solver_mode=FINITE_DIFFERENCE,
+        backend_config=BackendConfig(backend=NATIVE_JAX), solver_mode=FINITE_DIFFERENCE,
         time_integrator=RK4_LSRK, **_snap, **extra,
     )
 
 
 def _fd_pallas(block=BEST_BLOCK, **extra):
     return SimulationConfig(
-        backend=PALLAS, solver_mode=FINITE_DIFFERENCE, time_integrator=RK4_LSRK,
-        pallas_block_shape=block, pallas_use_triton=True, pallas_interpret=False,
+        backend_config=BackendConfig(
+            backend=PALLAS, pallas_block_shape=block,
+            pallas_use_triton=True, pallas_interpret=False,
+        ),
+        solver_mode=FINITE_DIFFERENCE, time_integrator=RK4_LSRK,
         **_snap, **extra,
     )
 

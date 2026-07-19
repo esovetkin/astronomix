@@ -15,7 +15,7 @@ import subprocess
 
 # typing
 from types import NoneType
-from typing import NamedTuple, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 from jaxtyping import Array, Float
 
 # jax
@@ -361,19 +361,24 @@ class PositivityConfig(NamedTuple):
     preserving_flux: bool = False
 
 
-class SimulationConfig(NamedTuple):
-    """
-    Configuration object for the simulation.
-    The simulation configuration are parameters defining
-    the simulation where changes necessitate recompilation.
-    """
+class BackendConfig(NamedTuple):
+    """Compute-backend configuration: which backend runs the kernels and the
+    Pallas/Triton knobs that shape them.
 
-    # Static simulation parameters
+    Grouped as its own sub-config (like ``PositivityConfig`` / ``GravityConfig``)
+    so backend concerns stay together.  Construct nested, e.g.
+    ``SimulationConfig(backend_config=BackendConfig(backend=NATIVE_JAX))``.
+    """
 
     #: Backend. Defaults to OPTIMAL_BACKEND, which ``finalize_config`` resolves
     #: to PALLAS on compute-capability >= 8.0 GPUs and NATIVE_JAX otherwise.
     backend: int = OPTIMAL_BACKEND
-    pallas_block_shape: Tuple[int, int, int] = (4, 4, 8)
+    #: Pallas kernel block shape ``(bx, by, bz)``; ``None`` picks the tuned
+    #: per-dimensionality default (see ``_default_pallas_block_shape``),
+    #: clamped to the grid extents.  With the default ``pallas_num_warps=4``
+    #: keep blocks at 128 cells (one element per thread) — larger blocks
+    #: register-spill in the f64 WENO kernels, smaller ones idle threads.
+    pallas_block_shape: Optional[Tuple[int, int, int]] = None
     pallas_use_triton: bool = True
     pallas_interpret: bool = False
     pallas_num_warps: int = 4
@@ -386,6 +391,30 @@ class SimulationConfig(NamedTuple):
     #: small-N memory profile matters; the rest of the Pallas backend
     #: stays on regardless.
     pallas_ct: bool = False
+    #: Replace the IEEE ``sqrt`` in the MHD WENO kernel with the refined
+    #: approximate ``rsqrt`` path (``x * jax.lax.rsqrt(x)`` -> ``rsqrt.approx.f64``,
+    #: still ~1 ULP).  On A100 this cut the dp WENO kernel ~1.6x and the full
+    #: dp step ~1.77x (spill loads halved) with Alfvén L1 convergence bit-identical.
+    #: NOTE: the *forward* kernel is switched but the hand-written Pallas
+    #: *adjoints* still use IEEE ``sqrt``; with this on, reverse-mode AD is
+    #: therefore ~1 ULP inconsistent with the forward (``finalize_config`` warns).
+    #: There is no equivalent fast f64 path for division, so only ``sqrt`` changes.
+    use_approximate_rsqrt: bool = False
+
+
+class SimulationConfig(NamedTuple):
+    """
+    Configuration object for the simulation.
+    The simulation configuration are parameters defining
+    the simulation where changes necessitate recompilation.
+    """
+
+    # Static simulation parameters
+
+    #: Compute-backend configuration (see :class:`BackendConfig`): backend
+    #: choice + Pallas/Triton kernel knobs.  Accessed as
+    #: ``config.backend_config.backend`` / ``.pallas_block_shape`` / etc.
+    backend_config: BackendConfig = BackendConfig()
 
     #: Basic solver mode, either finite volume or finite difference.
     #: Defaults to the finite-difference HOW-MHD scheme (Jeongbhin Seo,
@@ -658,16 +687,29 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     """
 
     # Resolve the OPTIMAL_BACKEND request into a concrete backend before any
-    # downstream code inspects ``config.backend``. PALLAS needs an Ampere-class
+    # downstream code inspects ``config.backend_config.backend``. PALLAS needs an Ampere-class
     # (compute capability >= 8.0) GPU for its Triton kernels; anywhere else we
     # fall back to the portable NATIVE_JAX backend.
-    if config.backend == OPTIMAL_BACKEND:
+    if config.backend_config.backend == OPTIMAL_BACKEND:
         if gpu_compute_capability_at_least_80():
             print("OPTIMAL_BACKEND: using the PALLAS backend (GPU compute capability >= 8.0).")
-            config = config._replace(backend=PALLAS)
+            config = config._replace(backend_config=config.backend_config._replace(backend=PALLAS))
         else:
             print("OPTIMAL_BACKEND: using the NATIVE_JAX backend (no compute capability >= 8.0 GPU found).")
-            config = config._replace(backend=NATIVE_JAX)
+            config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
+
+    # Approximate-rsqrt fast path: the forward MHD WENO kernel is switched to the
+    # refined approximate rsqrt, but the hand-written Pallas adjoints still use
+    # IEEE sqrt.  Purely forward runs (convergence, runtime) are unaffected; warn
+    # only so a reverse-mode/AD user knows the forward and backward differ by the
+    # rsqrt's ~1 ULP.
+    if config.backend_config.use_approximate_rsqrt:
+        print(
+            "NOTE: backend_config.use_approximate_rsqrt is ON — the MHD WENO "
+            "forward kernel uses approximate rsqrt while its adjoints use IEEE "
+            "sqrt, so reverse-mode gradients are ~1 ULP inconsistent with the "
+            "forward. Fine for forward-only runs; turn off for exact AD."
+        )
 
     # ``default_positivity_protection`` is a casual on/off switch for the STATE
     # floors only: the default ``False`` is a clean slate (no per-stage /

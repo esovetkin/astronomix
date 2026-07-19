@@ -135,6 +135,7 @@ from astronomix._fluid_equations._fluxes_mhd import _euler_flux_isothermal_x, _m
 from astronomix._fluid_equations._equations import primitive_state_from_conserved
 from astronomix._fluid_equations._fluxes import _euler_flux
 from astronomix._stencil_operations._stencil_operations import _shift
+from astronomix._finite_difference._interface_fluxes._weno_weights import _weno_omega_weights
 
 
 @partial(jax.jit, static_argnames=["registered_variables", "config"])
@@ -301,18 +302,10 @@ def _weno_flux_x_native(
         IS1_p = 13.0 * (bterm_p - cterm_p)**2 + 3.0 * (bterm_p + cterm_p)**2
         IS2_p = 13.0 * (cterm_p - dterm_p)**2 + 3.0 * (3.0*cterm_p - dterm_p)**2
 
-        alpha0_p = 1.0 / (epsilon + IS0_p)**2
-        alpha1_p = 6.0 / (epsilon + IS1_p)**2
-        alpha2_p = 3.0 / (epsilon + IS2_p)**2
+        omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, 1e-14)
 
-        alpha_sum_p = alpha0_p + alpha1_p + alpha2_p
-        alpha_sum_p = jnp.maximum(alpha_sum_p, 1e-14)  # prevent division by zero
-
-        omega0_p = alpha0_p / alpha_sum_p
-        omega2_p = alpha2_p / alpha_sum_p
-
-        second = (omega0_p * (aterm_p - 2.0*bterm_p + cterm_p) / 3.0
-                  + (omega2_p - 0.5) * (bterm_p - 2.0*cterm_p + dterm_p) / 6.0)
+        second = (omega0_p * (aterm_p - 2.0*bterm_p + cterm_p) * (1.0 / 3.0)
+                  + (omega2_p - 0.5) * (bterm_p - 2.0*cterm_p + dterm_p) * (1.0 / 6.0))
 
         # Backward WENO similarly with the matching stencil differences:
         aterm_m = 0.5 * (d4 - amx * dq4)   # corresponds to original dFsk[4] etc.
@@ -324,18 +317,10 @@ def _weno_flux_x_native(
         IS1_m = 13.0 * (bterm_m - cterm_m)**2 + 3.0 * (bterm_m + cterm_m)**2
         IS2_m = 13.0 * (cterm_m - dterm_m)**2 + 3.0 * (3.0*cterm_m - dterm_m)**2
 
-        alpha0_m = 1.0 / (epsilon + IS0_m)**2
-        alpha1_m = 6.0 / (epsilon + IS1_m)**2
-        alpha2_m = 3.0 / (epsilon + IS2_m)**2
+        omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, 1e-14)
 
-        alpha_sum_m = alpha0_m + alpha1_m + alpha2_m
-        alpha_sum_m = jnp.maximum(alpha_sum_m, 1e-14)  # prevent division by zero
-
-        omega0_m = alpha0_m / alpha_sum_m
-        omega2_m = alpha2_m / alpha_sum_m
-
-        third = (omega0_m * (aterm_m - 2.0*bterm_m + cterm_m) / 3.0
-                 + (omega2_m - 0.5) * (bterm_m - 2.0*cterm_m + dterm_m) / 6.0)
+        third = (omega0_m * (aterm_m - 2.0*bterm_m + cterm_m) * (1.0 / 3.0)
+                 + (omega2_m - 0.5) * (bterm_m - 2.0*cterm_m + dterm_m) * (1.0 / 6.0))
 
         Fs = -second + third
 

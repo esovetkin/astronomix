@@ -47,6 +47,7 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
+    BackendConfig,
 )
 
 # astronomix functions
@@ -120,8 +121,10 @@ def simulate(solver_mode, num_cells):
         boundary_settings=PERIODIC_2D,
         # FD/WENO runs ~10x faster through the Pallas backend (bit-compatible).
         # The block must divide the grid; (8, 8, 1) divides both 200 and 400.
-        backend=PALLAS if is_fd else NATIVE_JAX,
-        pallas_block_shape=(8, 8, 1),
+        backend_config=BackendConfig(
+            backend=PALLAS if is_fd else NATIVE_JAX,
+            pallas_block_shape=(8, 8, 1),
+        ),
     )
     rv = get_registered_variables(config)
 

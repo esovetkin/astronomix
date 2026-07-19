@@ -1,0 +1,74 @@
+# AthenaPK - a performance portable block structured AMR MHD code
+# Copyright (c) 2021, Athena Parthenon Collaboration. All rights reserved.
+# Licensed under the BSD 3-Clause License (the "LICENSE");
+
+<comment>
+problem   = 3D Circularly Polarized Alfvén Wave -- convergence test
+reference = G. Toth. JCP, vol. 161, pp. 605-662 (2000)
+
+Box: Lx=3, Ly=Lz=1.5.  Grid: 2N × N × N.
+Wave propagates along (1,2,2)/3 (the domain diagonal); one wavelength
+per period. With v_A = B_par/sqrt(rho) = 1, the period is T = lambda/v_A = 1.
+t_end = 5 corresponds to five complete periods, so the analytic state
+returns exactly to the initial condition.
+
+Angles ang_2 and ang_3 are not set here: cpaw.cpp auto-computes them
+from the box dimensions, giving n = (1,2,2)/3 for this 3:1.5:1.5 box.
+
+Resolution (nx1,nx2,nx3) and meshblock sizes are meant to be overridden
+on the command line. This file contains the smallest supported set.
+
+<job>
+problem_id = cpaw
+
+<problem/cpaw>
+compute_error = true
+b_par   = 1.0     # B parallel (sets Alfven speed = 1 with rho=1)
+b_perp  = 0.1     # B perpendicular (perturbation amplitude)
+pres    = 0.1     # pressure
+v_par   = 0.0     # traveling wave (v_par=0), not standing
+dir     = 1       # right polarization
+
+<parthenon/mesh>
+refinement = none
+nghost = 3
+
+nx1 = 16
+x1min = 0.0
+x1max = 3.0
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 8
+x2min = 0.0
+x2max = 1.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 8
+x3min = 0.0
+x3max = 1.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+minimum_number_of_teams_for_boundary_kernel = 256
+
+<parthenon/meshblock>
+nx1 = 16
+nx2 = 8
+nx3 = 8
+
+<parthenon/time>
+integrator = rk3
+cfl = 0.4
+tlim = 5.0
+nlim = 1000000
+perf_cycle_offset = 2
+
+<hydro>
+fluid = glmmhd
+eos = adiabatic
+reconstruction = ppm  
+riemann = hlld
+gamma = 1.666666666666667
+scratch_level = 1
