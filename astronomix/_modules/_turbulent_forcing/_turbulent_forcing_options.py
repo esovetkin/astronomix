@@ -23,6 +23,22 @@ class TurbulentForcingConfig(NamedTuple):
     #: forcing -- lets rotation organise coherent structures (columns).
     ou_forcing: bool = False
 
+    #: Coarse spectral-synthesis resolution for the OU forcing. ``0`` (the
+    #: default) keeps the original full-grid path: each fresh solenoidal draw
+    #: is synthesised by an inverse FFT on the whole simulation grid.  A
+    #: positive value ``nc`` instead draws and OU-evolves the forcing in
+    #: spectral space on a small ``nc^3`` grid and evaluates the band-limited
+    #: field on the fine grid by exact per-axis inverse-DFT matrix products.
+    #: Because the forcing spectrum k^6 exp(-8 k / kpk) is negligible beyond a
+    #: few kpk, ``nc = 64`` already carries the full spectrum to fp32
+    #: precision for the standard k_f -- while making the forcing scale to
+    #: sharded multi-node grids (the full-grid inverse FFT would otherwise be
+    #: replicated per device by the SPMD partitioner) and cutting its cost at
+    #: large N.  The OU update is linear, so evolving the spectrum and
+    #: synthesising afterwards is mathematically identical to evolving the
+    #: real-space field.
+    synthesis_resolution: int = 0
+
 
 class TurbulentForcingParams(NamedTuple):
     protection_density_threshold: float = 0.02

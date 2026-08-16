@@ -21,6 +21,13 @@ checklist at the end of `STYLE_GUIDE.md`. In short:
 - No debug probes, stray `print`s, or commented-out code in committed work.
 - Index state arrays through `registered_variables`, never hard-coded indices.
 
+## Running on JUPITER (JSC)
+
+This repo currently lives on the JUPITER Booster (aarch64 GH200 nodes). For
+storage rules (home is quota-limited — big files go to
+`/e/project1/astronomix/storcks1/` or scratch), environment setup, and how to
+queue Slurm jobs, **read `jupiter_guide.md`**.
+
 ## Verification
 
 Run style/correctness checks on CPU to avoid contending for the shared GPUs:

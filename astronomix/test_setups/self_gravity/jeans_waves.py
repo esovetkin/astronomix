@@ -36,7 +36,9 @@ We will run for N_periods = 3.
 from typing import NamedTuple
 
 # jax
+import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 
 # astronomix constants
 from astronomix import CARTESIAN
@@ -68,8 +70,10 @@ from astronomix.variable_registry.registered_variables import get_registered_var
 class JeansWaveSettings(NamedTuple):
     """Problem constants for the 3D Jeans linear wave test."""
 
-    #: Wavenumber vector ``k`` (one wavelength fits along each axis).
-    k_vec: jnp.array = jnp.array([2.0, 4.0, 4.0])
+    #: Wavenumber vector ``k`` (one wavelength fits along each axis).  A
+    #: plain tuple (not a jnp array) so the derived quantities stay concrete
+    #: Python floats even inside a jit trace (the sharded state builder).
+    k_vec: tuple = (2.0, 4.0, 4.0)
 
     #: Number of full wave periods to integrate over.
     n_periods: int = 3
@@ -90,19 +94,36 @@ class JeansWaveSettings(NamedTuple):
     #: Perturbation amplitude ``eps``.
     eps: float = 1e-6
 
+    #: Optional explicit box size ``(L_x, L_y, L_z)``.  The empty default
+    #: keeps the standard eigenmode behaviour (box derived from ``k_vec`` so
+    #: exactly one wavelength fits per axis).  Benchmark drivers override it
+    #: (box = grid, h = 1); the wave then merely provides a smooth, tiny
+    #: perturbation rather than an exact eigenmode, which is irrelevant for
+    #: throughput measurements.
+    box_size: tuple = ()
+
 
 def _derived(settings: JeansWaveSettings):
-    """Return values derived from the primary settings."""
-    k_squared = float(jnp.sum(settings.k_vec ** 2))
+    """Return values derived from the primary settings.
+
+    Uses plain Python math (not jnp) so every derived value is a concrete
+    float even when called from inside a jit trace.
+    """
+    k_squared = float(sum(k * k for k in settings.k_vec))
     # Dispersion relation: w = sqrt(c_s^2 k^2 - 4 pi G rho_B)
-    omega = float(jnp.sqrt(settings.c_s_squared * k_squared - settings.four_pi_g * settings.rho_b))
+    omega = float(
+        settings.c_s_squared * k_squared - settings.four_pi_g * settings.rho_b
+    ) ** 0.5
     period = 2.0 * jnp.pi / omega
     t_end = settings.n_periods * period
-    box_size = (
-        float(2.0 * jnp.pi / settings.k_vec[0]),
-        float(2.0 * jnp.pi / settings.k_vec[1]),
-        float(2.0 * jnp.pi / settings.k_vec[2]),
-    )
+    if settings.box_size:
+        box_size = tuple(float(b) for b in settings.box_size)
+    else:
+        box_size = (
+            float(2.0 * jnp.pi / settings.k_vec[0]),
+            float(2.0 * jnp.pi / settings.k_vec[1]),
+            float(2.0 * jnp.pi / settings.k_vec[2]),
+        )
     g = settings.four_pi_g / (4.0 * jnp.pi)
     return k_squared, omega, period, t_end, box_size, g
 
@@ -266,3 +287,94 @@ def jeans_wave_solution(
         t=params.t_end,
         settings=settings,
     )
+
+
+def build_jeans_state_sharded(
+    config: SimulationConfig,
+    params: SimulationParams,
+    sharding,
+    settings: JeansWaveSettings = JeansWaveSettings(),
+) -> tuple[STATE_TYPE, SimulationConfig, SimulationParams]:
+    """Memory-lean, sharding-aware Jeans-wave setup for multi-GPU runs.
+
+    Identical physics to :func:`setup_jeans_wave`, but the initial state is
+    produced as a globally-sharded ``jax.Array`` with each process computing
+    only its local shard (the coordinate meshgrid and wave fields are
+    evaluated inside a single jit under sharding constraints), so the full
+    global grid never lives on one device.
+
+    ``config.num_cells`` must already be set (to the *global* grid shape).
+    Pass ``sharding=None`` to get the single-device lean path.
+    """
+    _, _, _, t_end, box_size, g = _derived(settings)
+
+    config = config._replace(
+        geometry=CARTESIAN,
+        dimensionality=3,
+        box_size=StaticFloatVector(*box_size),
+        boundary_settings=BoundarySettings(
+            x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            z=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+        ),
+        mhd=False,
+        gravity_config=config.gravity_config._replace(self_gravity=True),
+    )
+    params = params._replace(
+        t_end=t_end,
+        gamma=settings.gamma,
+        gravitational_constant=g,
+    )
+
+    registered_variables = get_registered_variables(config)
+
+    nx = int(config.num_cells.x)
+    ny = int(config.num_cells.y)
+    nz = int(config.num_cells.z)
+    Lx, Ly, Lz = box_size
+    grid_spacing = Lx / nx
+
+    # Fields are mapped to the same mesh axes as the primitive state (drop
+    # the leading vars entry of the state spec, as in
+    # simulation_helper_data._apply_sharding).
+    spatial_sharding = None
+    if sharding is not None:
+        spatial_sharding = jax.NamedSharding(
+            sharding.mesh, PartitionSpec(*sharding.spec[1:4])
+        )
+
+    def _evaluate_wave_fields():
+        # Everything from the meshgrid on is traced, so under a sharding the
+        # partitioner materialises only each device's shard of the coordinate
+        # and wave arrays.
+        x = jnp.linspace(grid_spacing / 2, Lx + grid_spacing / 2, nx, endpoint=False)
+        y = jnp.linspace(grid_spacing / 2, Ly + grid_spacing / 2, ny, endpoint=False)
+        z = jnp.linspace(grid_spacing / 2, Lz + grid_spacing / 2, nz, endpoint=False)
+        Xc, Yc, Zc = jnp.meshgrid(x, y, z, indexing="ij")
+        if spatial_sharding is not None:
+            Xc = jax.lax.with_sharding_constraint(Xc, spatial_sharding)
+            Yc = jax.lax.with_sharding_constraint(Yc, spatial_sharding)
+            Zc = jax.lax.with_sharding_constraint(Zc, spatial_sharding)
+        return _wave_primitive_state(Xc, Yc, Zc, t=0.0, settings=settings)
+
+    out_shardings = (
+        None if spatial_sharding is None else (spatial_sharding,) * 5
+    )
+    rho, v_x, v_y, v_z, p = jax.jit(
+        _evaluate_wave_fields,
+        out_shardings=out_shardings,
+    )()
+
+    state = construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=rho,
+        velocity_x=v_x,
+        velocity_y=v_y,
+        velocity_z=v_z,
+        gas_pressure=p,
+        sharding=sharding,
+    )
+
+    config = finalize_config(config, state.shape)
+    return state, config, params

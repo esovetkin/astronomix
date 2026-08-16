@@ -48,7 +48,9 @@ The uniform B background is added analytically in both cases.
 from typing import NamedTuple
 
 # jax
+import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 
 # astronomix constants
 from astronomix import CARTESIAN
@@ -339,6 +341,153 @@ def setup_cp_alfven_wave(
 
     config = finalize_config(config, state.shape)
 
+    return state, config, params
+
+
+def build_cp_alfven_state_sharded(
+    config: SimulationConfig,
+    params: SimulationParams,
+    sharding,
+    settings: CPAlfvenWave3DSettings = CPAlfvenWave3DSettings(),
+) -> tuple[STATE_TYPE, SimulationConfig, SimulationParams]:
+    """Memory-lean, sharding-aware CP Alfvén-wave setup for multi-GPU runs.
+
+    Identical physics to :func:`setup_cp_alfven_wave` (FD solver branch), but
+    the initial state is produced as a globally-sharded ``jax.Array`` with
+    each process computing only its local shard: the staggered edge grids,
+    the vector potential, its discrete curl and the face-to-center
+    interpolation are all evaluated inside a single jit under sharding
+    constraints, so the full global grid never lives on one device.  This is
+    what makes multi-node MHD weak-scaling runs possible.
+
+    ``config.num_cells`` must already be set (to the *global* grid shape).
+    Pass ``sharding=None`` to get the single-device lean path.  Only the
+    finite-difference (constrained-transport) solver branch is supported.
+    """
+    if config.solver_mode != FINITE_DIFFERENCE:
+        raise ValueError(
+            "build_cp_alfven_state_sharded supports only the "
+            "FINITE_DIFFERENCE solver branch."
+        )
+
+    config = config._replace(
+        geometry=CARTESIAN,
+        dimensionality=3,
+        box_size=StaticFloatVector(*settings.box_size),
+        boundary_settings=BoundarySettings(
+            x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            z=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+        ),
+        mhd=True,
+    )
+    params = params._replace(t_end=settings.t_end, gamma=settings.gamma)
+
+    registered_variables = get_registered_variables(config)
+
+    nx = int(config.num_cells.x)
+    ny = int(config.num_cells.y)
+    nz = int(config.num_cells.z)
+    Lx, Ly, Lz = settings.box_size
+    dx = Lx / nx  # uniform iff the caller keeps the grid/box aspect matched
+
+    # Fields are mapped to the same mesh axes as the primitive state (drop
+    # the leading vars entry of the state spec, as in
+    # simulation_helper_data._apply_sharding).
+    spatial_sharding = None
+    if sharding is not None:
+        spatial_sharding = jax.NamedSharding(
+            sharding.mesh, PartitionSpec(*sharding.spec[1:4])
+        )
+
+    def _constrain(field):
+        if spatial_sharding is None:
+            return field
+        return jax.lax.with_sharding_constraint(field, spatial_sharding)
+
+    def _evaluate_wave_fields():
+        # Cell-center and staggered-edge coordinate lines (matching the FD
+        # branch of _generate_state); the 3D meshgrids are constrained to the
+        # target sharding immediately so the partitioner materialises only
+        # each device's shard of every coordinate and field array.
+        x_l = jnp.linspace(dx, Lx, nx, endpoint=True)
+        y_l = jnp.linspace(dx, Ly, ny, endpoint=True)
+        z_l = jnp.linspace(dx, Lz, nz, endpoint=True)
+        x_c = jnp.linspace(dx / 2, Lx + dx / 2, nx, endpoint=False)
+        y_c = jnp.linspace(dx / 2, Ly + dx / 2, ny, endpoint=False)
+        z_c = jnp.linspace(dx / 2, Lz + dx / 2, nz, endpoint=False)
+
+        # A_x lives on yz-edges  (i,   j+1/2, k+1/2)  ->  (x_c, y_l, z_l)
+        Xax, Yax, Zax = (
+            _constrain(g) for g in jnp.meshgrid(x_c, y_l, z_l, indexing="ij")
+        )
+        # A_y lives on zx-edges  (i+1/2, j,   k+1/2)  ->  (x_l, y_c, z_l)
+        Xay, Yay, Zay = (
+            _constrain(g) for g in jnp.meshgrid(x_l, y_c, z_l, indexing="ij")
+        )
+        # A_z lives on xy-edges  (i+1/2, j+1/2, k  )  ->  (x_l, y_l, z_c)
+        Xaz, Yaz, Zaz = (
+            _constrain(g) for g in jnp.meshgrid(x_l, y_l, z_c, indexing="ij")
+        )
+
+        A_x_edge, _, _ = _vector_potential(Xax, Yax, Zax, t=0.0, settings=settings)
+        _, A_y_edge, _ = _vector_potential(Xay, Yay, Zay, t=0.0, settings=settings)
+        _, _, A_z_edge = _vector_potential(Xaz, Yaz, Zaz, t=0.0, settings=settings)
+
+        # Discrete curl -> face-centered perturbation field; the stencil
+        # shifts along the sharded axis become halo exchanges under GSPMD.
+        bxb_pert = (1.0 / dx) * finite_difference_int6(A_z_edge, _YAXIS) \
+                 - (1.0 / dx) * finite_difference_int6(A_y_edge, _ZAXIS)
+        byb_pert = (1.0 / dx) * finite_difference_int6(A_x_edge, _ZAXIS) \
+                 - (1.0 / dx) * finite_difference_int6(A_z_edge, _XAXIS)
+        bzb_pert = (1.0 / dx) * finite_difference_int6(A_y_edge, _XAXIS) \
+                 - (1.0 / dx) * finite_difference_int6(A_x_edge, _YAXIS)
+
+        # Add the uniform background to the face fields.
+        bxb = bxb_pert + _R[0, 0] * settings.b_parallel
+        byb = byb_pert + _R[1, 0] * settings.b_parallel
+        bzb = bzb_pert + _R[2, 0] * settings.b_parallel
+
+        # Cell-centered B by face-to-center interpolation.
+        B_x = interp_face_to_center(bxb, _XAXIS)
+        B_y = interp_face_to_center(byb, _YAXIS)
+        B_z = interp_face_to_center(bzb, _ZAXIS)
+
+        # Cell-centered hydro state.
+        Xc, Yc, Zc = (
+            _constrain(g) for g in jnp.meshgrid(x_c, y_c, z_c, indexing="ij")
+        )
+        rho, v_x, v_y, v_z, p, _, _, _ = _wave_primitive_state(
+            Xc, Yc, Zc, t=0.0, settings=settings
+        )
+        return rho, v_x, v_y, v_z, p, B_x, B_y, B_z, bxb, byb, bzb
+
+    out_shardings = (
+        None if spatial_sharding is None else (spatial_sharding,) * 11
+    )
+    rho, v_x, v_y, v_z, p, B_x, B_y, B_z, bxb, byb, bzb = jax.jit(
+        _evaluate_wave_fields,
+        out_shardings=out_shardings,
+    )()
+
+    state = construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=rho,
+        velocity_x=v_x,
+        velocity_y=v_y,
+        velocity_z=v_z,
+        gas_pressure=p,
+        magnetic_field_x=B_x,
+        magnetic_field_y=B_y,
+        magnetic_field_z=B_z,
+        interface_magnetic_field_x=bxb,
+        interface_magnetic_field_y=byb,
+        interface_magnetic_field_z=bzb,
+        sharding=sharding,
+    )
+
+    config = finalize_config(config, state.shape)
     return state, config, params
 
 

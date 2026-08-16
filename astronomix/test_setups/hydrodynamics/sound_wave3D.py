@@ -92,7 +92,9 @@ class SoundWave3DSettings(NamedTuple):
 
 
 def _c_s(settings: SoundWave3DSettings) -> float:
-    return float(jnp.sqrt(settings.gamma * settings.p_0 / settings.rho_0))
+    # Plain Python math (not jnp) so the result stays a concrete float even
+    # when called from inside a jit trace (the sharded state builder).
+    return float(settings.gamma * settings.p_0 / settings.rho_0) ** 0.5
 
 
 def _omega(settings: SoundWave3DSettings) -> float:
@@ -218,23 +220,39 @@ def _build_sound_wave_fields(
     nx, ny, nz = config.num_cells.x, config.num_cells.y, config.num_cells.z
     Lx, Ly, Lz = config.box_size.x, config.box_size.y, config.box_size.z
 
-    x = jnp.linspace(gs / 2, Lx + gs / 2, nx, endpoint=False)
-    y = jnp.linspace(gs / 2, Ly + gs / 2, ny, endpoint=False)
-    z = jnp.linspace(gs / 2, Lz + gs / 2, nz, endpoint=False)
-    Xc, Yc, Zc = jnp.meshgrid(x, y, z, indexing="ij")
-
+    # X/Y/Z are mapped to the same mesh axes as the primitive state (drop the
+    # leading vars entry of the state spec, as in
+    # simulation_helper_data._apply_sharding).
+    spatial_sharding = None
     if sharding is not None:
-        # Stack axis (leading) replicated; X/Y/Z mapped to the same mesh axes
-        # as the primitive state (drop the leading vars entry of the state
-        # spec, as in simulation_helper_data._apply_sharding).
         spatial_sharding = jax.NamedSharding(
-            sharding.mesh, PartitionSpec(None, *sharding.spec[1:4])
-        )
-        Xc, Yc, Zc = jax.lax.with_sharding_constraint(
-            jnp.stack([Xc, Yc, Zc]), spatial_sharding
+            sharding.mesh, PartitionSpec(*sharding.spec[1:4])
         )
 
-    rho, v_x, v_y, v_z, p = _wave_primitive_state(Xc, Yc, Zc, t=0.0, settings=settings)
+    def _evaluate_wave_fields():
+        # Everything from the meshgrid on is traced, so under a sharding the
+        # partitioner materialises only each device's shard of the coordinate
+        # and wave arrays -- the full global grid never exists on one device.
+        # (Under multi-process sharding this must NOT run eagerly: eager ops
+        # produce the full global array per process, and unpacking a global
+        # multi-host array is not even permitted.)
+        x = jnp.linspace(gs / 2, Lx + gs / 2, nx, endpoint=False)
+        y = jnp.linspace(gs / 2, Ly + gs / 2, ny, endpoint=False)
+        z = jnp.linspace(gs / 2, Lz + gs / 2, nz, endpoint=False)
+        Xc, Yc, Zc = jnp.meshgrid(x, y, z, indexing="ij")
+        if spatial_sharding is not None:
+            Xc = jax.lax.with_sharding_constraint(Xc, spatial_sharding)
+            Yc = jax.lax.with_sharding_constraint(Yc, spatial_sharding)
+            Zc = jax.lax.with_sharding_constraint(Zc, spatial_sharding)
+        return _wave_primitive_state(Xc, Yc, Zc, t=0.0, settings=settings)
+
+    out_shardings = (
+        None if spatial_sharding is None else (spatial_sharding,) * 5
+    )
+    rho, v_x, v_y, v_z, p = jax.jit(
+        _evaluate_wave_fields,
+        out_shardings=out_shardings,
+    )()
 
     return construct_primitive_state(
         config=config,

@@ -222,3 +222,6 @@ examples/notebooks/differentiability/frames
 examples/scripts/differentiability/field_level_inference/panel_snaps.npz
 examples/scripts/differentiability/field_level_inference/*.png
 !examples/scripts/differentiability/field_level_inference/logo.png
+
+# core dumps from crashed jobs
+core.*

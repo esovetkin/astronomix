@@ -1057,7 +1057,11 @@ def run_weak_scaling_point(
     arg = int(result.argument_memory_bytes)
     tot = int(result.total_memory_bytes)
     total_cells = int(global_cells[0]) * int(global_cells[1]) * int(global_cells[2])
-    cells_per_s_per_gpu = (total_cells / runtime / G) if runtime > 0 else float("nan")
+    # Cell *updates* per second per GPU: cells x timesteps / runtime / GPUs
+    # (the convention of the paper's weak-scaling table).
+    cells_per_s_per_gpu = (
+        (total_cells * iters / runtime / G) if runtime > 0 else float("nan")
+    )
 
     # Gather each process's own measured runtime to expose load skew.
     runtimes = np.asarray(mh.process_allgather(jnp.asarray(runtime)))

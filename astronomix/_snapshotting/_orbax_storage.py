@@ -161,7 +161,7 @@ def latest_step(directory) -> Optional[int]:
     return max(steps) if steps else None
 
 
-def _abstract_pytree(tree_metadata, sharding):
+def _abstract_pytree(tree_metadata, sharding, replicated_keys=()):
     """Build an Orbax restore target (``ShapeDtypeStruct`` pytree) from saved
     array metadata, pinning each leaf to a concrete sharding.
 
@@ -170,6 +170,11 @@ def _abstract_pytree(tree_metadata, sharding):
     state / forcing fields) get the requested ``sharding``; scalars and the
     PRNG key data are replicated. When ``sharding`` is ``None`` everything is
     placed on the default device.
+
+    Top-level entries named in ``replicated_keys`` are forced onto the
+    replicated sharding regardless of rank -- used for the coarse spectral OU
+    forcing state, which is full-rank (3, nc, nc, nc) but logically
+    replicated (its axes generally do not divide the mesh).
     """
     if sharding is not None:
         spec_len = len(sharding.spec)
@@ -178,19 +183,26 @@ def _abstract_pytree(tree_metadata, sharding):
         def pick(leaf):
             return sharding if len(leaf.shape) == spec_len else replicated
     else:
-        single = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        replicated = jax.sharding.SingleDeviceSharding(jax.devices()[0])
 
         def pick(leaf):
-            return single
+            return replicated
 
-    def to_struct(leaf):
-        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=pick(leaf))
+    def to_struct(leaf, forced_replicated=False):
+        chosen = replicated if forced_replicated else pick(leaf)
+        return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=chosen)
 
-    return jax.tree.map(
-        to_struct,
-        tree_metadata,
-        is_leaf=lambda x: hasattr(x, "shape") and hasattr(x, "dtype"),
-    )
+    is_leaf = lambda x: hasattr(x, "shape") and hasattr(x, "dtype")  # noqa: E731
+    return {
+        name: jax.tree.map(
+            lambda leaf, forced=(name in replicated_keys): to_struct(
+                leaf, forced_replicated=forced
+            ),
+            subtree,
+            is_leaf=is_leaf,
+        )
+        for name, subtree in tree_metadata.items()
+    }
 
 
 def load_loop_checkpoint(
@@ -198,6 +210,7 @@ def load_loop_checkpoint(
     step: Optional[int] = None,
     *,
     sharding: Optional[jax.sharding.Sharding] = None,
+    replicated_keys: tuple = (),
 ) -> LoopCheckpoint:
     """Load a loop checkpoint from ``directory``.
 
@@ -208,6 +221,11 @@ def load_loop_checkpoint(
             leaves (``primitive_state`` / ``forcing``) — pass the sharding the
             resumed run will use so each device reads only its shard. When
             ``None`` the arrays are restored onto the default device.
+        replicated_keys: Top-level checkpoint entries to restore fully
+            replicated regardless of rank. Pass ``("forcing",)`` when the run
+            uses the coarse spectral OU forcing
+            (``synthesis_resolution > 0``), whose (3, nc, nc, nc) state is
+            logically replicated.
 
     Returns:
         A :class:`LoopCheckpoint`.
@@ -228,7 +246,7 @@ def load_loop_checkpoint(
         tree_metadata = (
             metadata.tree if hasattr(metadata, "tree") else metadata.item_metadata.tree
         )
-        target = _abstract_pytree(tree_metadata, sharding)
+        target = _abstract_pytree(tree_metadata, sharding, replicated_keys)
         tree = checkpointer.restore(path, target)
     finally:
         checkpointer.close()

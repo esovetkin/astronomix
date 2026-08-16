@@ -689,6 +689,20 @@ variant. `pallas_ct=True` saves the extra 2 MB and is the right
 choice when working memory is the binding constraint, at the cost of
 ~11 s extra compile.
 
+**Multi-GPU (2026-08 update).** The CT Pallas kernels are now routed
+through ``_pallas_call_sharded`` with stacked-channel I/O (the
+``(6, nx, ny, nz)`` modified fluxes and ``(3, nx, ny, nz)`` EMF / RHS
+slices ride the vars-first halo machinery), so ``pallas_ct=True`` is
+the *communication* optimization for sharded MHD runs: the native
+roll-based CT stencils cost one collective-permute per shift per slice
+(the dominant inter-node cost of the MHD FD step, measured
+latency-bound on JUPITER), while the staged kernels cost one ppermute
+pair per stage.  Sharded-vs-single-GPU agreement and the measured
+inter-node effect are recorded in the weak-scaling campaign notes
+(``examples/scripts/scaling/weak_scaling_gh200_section.tex``).  On a
+GH200 the toggle also cuts sharded MHD temp memory from 52 GB to 36 GB
+per device at 2.7e8 cells/GPU.
+
 ---
 
 ## 4.4 The x64 / Triton fix (was a real bug, now resolved)

@@ -274,8 +274,13 @@ def time_integration(
     # supplied mesh so pjit always sees a concrete sharding.
     if sharding is not None:
         replicated = jax.NamedSharding(sharding.mesh, PartitionSpec())
+        # jnp.asarray first: a cross-host replicated device_put asserts that
+        # every process passed the same value, but it gathers each host's
+        # value at the canonical fp32 and compares it to the raw fp64 Python
+        # scalar (e.g. gamma = 5/3), failing on dtype alone.  Presenting an
+        # fp32 array from every host keeps the assertion honest.
         params = jax.tree.map(
-            lambda leaf: jax.device_put(leaf, replicated),
+            lambda leaf: jax.device_put(jnp.asarray(leaf), replicated),
             params,
         )
 
@@ -1015,8 +1020,11 @@ def _time_integration_to_disk(
             # dispatch on a multi-device mesh sees a sharding for the freshly
             # set t_start / t_end scalars too (see the note in time_integration).
             if replicated is not None:
+                # jnp.asarray first, for the same cross-host fp32-vs-fp64
+                # comparison reason as in time_integration's params promotion.
                 segment_params = jax.tree.map(
-                    lambda leaf: jax.device_put(leaf, replicated), segment_params
+                    lambda leaf: jax.device_put(jnp.asarray(leaf), replicated),
+                    segment_params,
                 )
 
             with mesh_ctx, pallas_mesh_context(pallas_mesh):
@@ -1042,7 +1050,16 @@ def _time_integration_to_disk(
             if sharding is not None:
                 store_state = jax.device_put(primitive_state, sharding)
                 if forcing is not None:
-                    store_forcing = jax.device_put(forcing, sharding)
+                    # The full-grid OU field shards like the state; the coarse
+                    # spectral OU state (synthesis_resolution > 0) is a small
+                    # replicated array and must stay replicated -- its nc^3
+                    # axes generally do not divide the mesh.
+                    forcing_sharding = (
+                        replicated
+                        if config.turbulent_forcing_config.synthesis_resolution > 0
+                        else sharding
+                    )
+                    store_forcing = jax.device_put(forcing, forcing_sharding)
 
             save_loop_checkpoint(
                 checkpointer,

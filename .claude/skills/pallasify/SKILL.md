@@ -430,6 +430,23 @@ interior block outputs are correctness-critical.
 ``kernel_build_fn(*state_inputs, *other_args)`` — same kernel, same
 compile cache, same perf.
 
+**Single-channel field slices: stack them.**  ``_pallas_call_sharded``
+assumes vars-first state-shaped arrays (its sharded-axis inference and
+halo slicing index spatial axes starting at 1).  A kernel whose inputs
+or outputs are bare 3-D field slices (interface fluxes, EMFs, RHS
+components) must **stack them along a leading channel axis** —
+``jnp.stack([...])`` at the wrapper level, ``ref[channel, ii, jj, kk]``
+inside the kernel, one stacked ``out_ref`` instead of a tuple of 3-D
+outputs — so they ride the same machinery.  This also collapses N
+per-slice halo exchanges into one, which is the entire point on the
+latency-bound inter-node path: the roll-based native CT stencils cost
+one collective-permute *per shift per slice*, while the stacked staged
+kernels cost one ppermute pair per stage.  The CT kernels in
+``_constrained_transport_pallas.py`` (stacked ``(6, nx, ny, nz)``
+modified fluxes, ``(3, nx, ny, nz)`` EMFs / RHS) are the canonical
+example.  Chain stages through their *public* wrappers and keep the
+intermediates stacked between stages.
+
 ### 4c. Multi-stage pipeline: split, don't fuse
 
 If a native pipeline computes A → B → C → D where each arrow is a
@@ -442,10 +459,12 @@ single kernel).
 Split at every natural intermediate. For CT we now have **three**
 bounded-halo Pallas kernels in `_constrained_transport_pallas.py`
 (`_ct_modified_flux_pallas`, `_ct_edge_emf_pallas`,
-`_ct_curl_pallas`); each has halo ≤ 2 and compiles in well under a
-second. The intermediates between kernels are real allocations, but
-they're each 1/4 the size of the full state, and the alternative was
-a kernel that never finished compiling.
+`_ct_curl_pallas`); each has halo ≤ 4 and compiles in well under a
+second, and each is a public wrapper over a ``*_local`` build routed
+through ``_pallas_call_sharded`` (stacked-channel I/O, one halo
+exchange per stage). The intermediates between kernels are real
+allocations, but they're each well under the full state size, and the
+alternative was a kernel that never finished compiling.
 
 Heuristic: target halo ≤ 4 per kernel. If your native pipeline has
 more than two consecutive stencil stages, split.

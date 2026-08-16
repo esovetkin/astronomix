@@ -1,0 +1,148 @@
+% ---------------------------------------------------------------------------
+% Drop-in replacement/extension for the weak-scaling subsection of the
+% methods paper, based on the 2026-08 campaign on the JUPITER Booster
+% (JSC): NVIDIA GH200 (96 GB), 4 GPUs/node, one process per GPU, fp32,
+% FD (Pallas), LSRK4, block shape (4,4,8), 10 fixed steps, 1D x
+% decomposition.  All multi-node rungs were measured with benchmark jobs
+% serialized (one at a time) -- concurrent rungs on the shared fabric
+% inflate inter-node numbers by up to 3x.  Raw data:
+% examples/scripts/scaling/data/weak_scaling/; regenerate rows with
+% examples/scripts/scaling/make_weak_tables.py (tags gh200 / gh200_ct /
+% gh200b / gh200fft_lhs).
+% ---------------------------------------------------------------------------
+
+\subsection{Weak scaling}
+\label{sec:weak_scaling}
+
+For the weak-scaling tests the per-GPU sub-domain is held fixed while the
+device count grows, so ideal scaling is a flat wall-clock curve.  The
+initial condition is built in a globally sharded manner for all three
+configurations (each process materializes only its local shard) -- for MHD
+this includes the staggered vector-potential construction that keeps the
+discrete face-centered field divergence-free, so the full grid never
+resides on a single host.  All runs use fp32, the LSRK4 integrator, a
+Pallas block shape of $(4,4,8)$ (re-validated as optimal on GH200), 10
+fixed timesteps, one process per GPU, and a 1D $x$ decomposition on the
+JUPITER Booster (NVIDIA GH200, 4 GPUs per node).  We quote per-GPU
+throughput in Mcell/s/GPU: millions of cell updates (grid cells $\times$
+timesteps) per second and per GPU.
+
+\begin{table}
+    \centering
+    \caption{Weak-scaling results for the 3D sound-wave (hydro) test with
+    the FD (Pallas) solver on NVIDIA GH200 GPUs.  The per-GPU sub-domain
+    is fixed at $128\times2048\times2048$ ($5.4\cdot10^{8}$ cells).
+    Efficiency is $T(1)/T(G)$ (ideal $=100\%$).}
+    \label{tab:weak_scaling_hydro}
+    \begin{tabular}{rrlrrrr}
+        \toprule
+        GPUs & Nodes & Global grid & Cells & Runtime [s] & Eff.\ [\%] & Mcell/s/GPU \\
+        \midrule
+        1 & 1 & $128\times2048^{2}$ & $5.4\cdot10^{8}$ & 11.21 & 100.0 & 479 \\
+        2 & 1 & $256\times2048^{2}$ & $1.1\cdot10^{9}$ & 13.83 & 81.0 & 388 \\
+        4 & 1 & $512\times2048^{2}$ & $2.1\cdot10^{9}$ & 13.90 & 80.6 & 386 \\
+        8 & 2 & $1024\times2048^{2}$ & $4.3\cdot10^{9}$ & 16.99 & 66.0 & 316 \\
+        16 & 4 & $2048^{3}$ & $8.6\cdot10^{9}$ & 17.07 & 65.7 & 315 \\
+        32 & 8 & $4096\times2048^{2}$ & $1.7\cdot10^{10}$ & 17.63 & 63.5 & 304 \\
+        64 & 16 & $8192\times2048^{2}$ & $3.4\cdot10^{10}$ & 18.45 & 60.7 & 291 \\
+        128 & 32 & $16384\times2048^{2}$ & $6.9\cdot10^{10}$ & 19.35 & 57.9 & 277 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{As Table~\ref{tab:weak_scaling_hydro} but for ideal MHD (the
+    CP Alfv\'en-wave setup at benchmark amplitude), per-GPU sub-domain
+    $128\times2048\times1024$ ($2.7\cdot10^{8}$ cells; the 11-field MHD
+    state halves the memory-feasible sub-domain), with the staged
+    Pallas constrained-transport kernels enabled
+    (\texttt{pallas\_ct}).  Numbers in brackets give the default
+    roll-based CT path, whose per-shift collective permutes dominate the
+    inter-node cost.}
+    \label{tab:weak_scaling_mhd}
+    \begin{tabular}{rrlrrrr}
+        \toprule
+        GPUs & Nodes & Global grid & Cells & Runtime [s] & Eff.\ [\%] & Mcell/s/GPU \\
+        \midrule
+        1 & 1 & $128\times2048\times1024$ & $2.7\cdot10^{8}$ & 15.60 [13.47] & 100.0 & 172 \\
+        2 & 1 & $256\times2048\times1024$ & $5.4\cdot10^{8}$ & 19.47 [18.67] & 80.1 & 138 \\
+        4 & 1 & $512\times2048\times1024$ & $1.1\cdot10^{9}$ & 19.26 [17.22] & 81.0 & 139 \\
+        8 & 2 & $1024\times2048\times1024$ & $2.1\cdot10^{9}$ & 27.77 [33.04] & 56.2 & 97 \\
+        16 & 4 & $2048\times2048\times1024$ & $4.3\cdot10^{9}$ & 27.53 [43.28] & 56.7 & 98 \\
+        32 & 8 & $4096\times2048\times1024$ & $8.6\cdot10^{9}$ & 28.30 [48.21] & 55.1 & 95 \\
+        64 & 16 & $8192\times2048\times1024$ & $1.7\cdot10^{10}$ & 33.42 [51.97] & 46.7 & 80 \\
+        128 & 32 & $16384\times2048\times1024$ & $3.4\cdot10^{10}$ & 34.73 [58.58] & 44.9 & 77 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}
+    \centering
+    \caption{As Table~\ref{tab:weak_scaling_hydro} but for hydrodynamics
+    with self-gravity (the Jeans-wave setup at benchmark amplitude),
+    per-GPU sub-domain $64\times1024\times1024$ ($6.7\cdot10^{7}$ cells),
+    with the slab-decomposed distributed FFT Poisson solver and the XLA
+    latency-hiding scheduler.  Numbers in brackets give the replicated-FFT
+    baseline, whose per-device memory grows with the \emph{global} grid
+    (out of memory beyond 64 GPUs).}
+    \label{tab:weak_scaling_selfgrav}
+    \begin{tabular}{rrlrrrr}
+        \toprule
+        GPUs & Nodes & Global grid & Cells & Runtime [s] & Eff.\ [\%] & Mcell/s/GPU \\
+        \midrule
+        1 & 1 & $64\times1024^{2}$ & $6.7\cdot10^{7}$ & 2.13 [1.80] & 100.0 & 315 \\
+        2 & 1 & $128\times1024^{2}$ & $1.3\cdot10^{8}$ & 2.58 [2.29] & 82.5 & 260 \\
+        4 & 1 & $256\times1024^{2}$ & $2.7\cdot10^{8}$ & 3.19 [3.81] & 66.7 & 210 \\
+        8 & 2 & $512\times1024^{2}$ & $5.4\cdot10^{8}$ & 3.98 [4.68] & 53.5 & 169 \\
+        16 & 4 & $1024^{3}$ & $1.1\cdot10^{9}$ & 4.33 [7.33] & 49.2 & 155 \\
+        32 & 8 & $2048\times1024^{2}$ & $2.1\cdot10^{9}$ & 5.33 [12.33] & 39.9 & 126 \\
+        64 & 16 & $4096\times1024^{2}$ & $4.3\cdot10^{9}$ & 6.10 [23.34] & 34.9 & 110 \\
+        128 & 32 & $8192\times1024^{2}$ & $8.6\cdot10^{9}$ & 7.78 [---] & 27.3 & 86 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+For pure hydrodynamics (Table~\ref{tab:weak_scaling_hydro}) the picture of
+the original H100 measurements is reproduced at a higher absolute level:
+the GH200 sustains 479~Mcell/s/GPU on a single device ($1.7\times$ the
+H100), pays a one-time $\sim\!19\%$ toll for the onset of halo exchange
+and a further step at the first node boundary, and then degrades only
+slowly -- $66\%$ efficiency at the $2048^{3}$ / 16-GPU point of the
+original study and still $58\%$ at $128$ GPUs on a
+$16384\times2048^{2}$ grid ($6.9\cdot10^{10}$ cells, $8\times$ the largest
+previously published run), sustaining $277$~Mcell/s/GPU.
+
+For MHD (Table~\ref{tab:weak_scaling_mhd}) the constrained-transport and
+face-interpolation layer is the communication hot spot: its native
+roll-based stencils issue one collective permute per stencil shift per
+field slice, and the resulting inter-node cost is dominated by the
+\emph{number} of collectives rather than the exchanged volume (reducing
+the exchanged halo area $4\times$ at fixed per-GPU cell count lowers the
+inter-node communication time by only $\sim\!30\%$, where a
+bandwidth-bound exchange would shrink it nearly fourfold).  Routing the staged Pallas CT kernels
+through the shard-map halo exchange (\texttt{pallas\_ct}; one exchange
+per stage, with the single-channel flux and EMF slices stacked onto the
+vars-first layout) cuts the communication time by $\sim\!40\%$ and the
+large-$G$ runtime by $\sim\!40\%$: $45\%$ efficiency and
+77~Mcell/s/GPU at 128 GPUs, versus $23\%$ and 46~Mcell/s/GPU for the
+default path (bracketed).  The toggle costs $\sim\!16\%$ on a single
+GPU, which is why it remains opt-in; sharded-versus-single-device
+results are bit-identical.
+
+For self-gravity (Table~\ref{tab:weak_scaling_selfgrav}) the limiting
+factor is the FFT Poisson solve.  The XLA SPMD partitioner replicates the
+operand of an FFT along its transform dimensions, so the straightforward
+formulation costs global-grid memory and work on \emph{every} device --
+per-GPU throughput then decays roughly as $1/G$ (bracketed numbers), and
+the global grid is capped by single-device memory.  We therefore added a
+slab-decomposed distributed Poisson solver (shard-map with all-to-all
+transposes between the $x$- and $y$-pencil decompositions, mathematically
+identical to the replicated transform), which keeps the per-device
+footprint flat ($12.3$~GB at every rung versus $65$~GB at 64~GPUs for the
+replicated path) and removes the global-size cap.  Together with the XLA
+latency-hiding scheduler (which overlaps the transpose collectives with
+stencil compute at no single-GPU cost) the solver reaches $35\%$
+efficiency at 64 GPUs -- $4.5\times$ the replicated baseline -- and still
+$27\%$ at 128 GPUs on an $8192\times1024^{2}$ grid.
+% ---------------------------------------------------------------------------

@@ -71,14 +71,14 @@ jax.config.update("jax_use_shardy_partitioner", False)
 jax.config.update("jax_enable_x64", False)
 
 from astronomix.option_classes.simulation_config import (  # noqa: E402
-    FD_FLUX_GRAVITY,
     FINITE_DIFFERENCE,
     FINITE_VOLUME,
+    FOURTH_ORDER_CONSERVATIVE,
     NATIVE_JAX,
     PALLAS,
     RK4_LSRK,
-    SIMPLE_SOURCE_TERM,
-    WENO_FLUX_GRAVITY,
+    SIMPLE_SOURCE,
+    GravityConfig,
     SimulationConfig,
     SnapshotSettings,
     StaticFloatVector,
@@ -146,7 +146,12 @@ def _fd_pallas(block=BEST_BLOCK, **extra):
 
 _HYDRO = dict(box_size=StaticFloatVector(3.0, 1.5, 1.5), mhd=False, dimensionality=3)
 _MHD = dict(box_size=StaticFloatVector(3.0, 1.5, 1.5), mhd=True, dimensionality=3)
-_SG = dict(mhd=False, self_gravity=True, dimensionality=3)
+_SG = dict(mhd=False, dimensionality=3)
+
+
+def _gravity(version):
+    """Self-gravity sub-config with the requested coupling scheme."""
+    return GravityConfig(self_gravity=True, self_gravity_version=version)
 
 
 def _hydro_specs():
@@ -169,9 +174,9 @@ def _selfgrav_specs():
     # Self-gravity is FD-centric; FV support is probed empirically (the
     # benchmark records a NaN row if a config is unsupported).
     return [
-        BenchmarkSpec("FD (JAX)", _fd_jax(self_gravity_version=WENO_FLUX_GRAVITY, **_SG), 1.5),
-        BenchmarkSpec("FD (Pallas)", _fd_pallas(self_gravity_version=WENO_FLUX_GRAVITY, **_SG), 1.5),
-        BenchmarkSpec("FV (JAX)", _fv(self_gravity_version=SIMPLE_SOURCE_TERM, **_SG), 0.4),
+        BenchmarkSpec("FD (JAX)", _fd_jax(gravity_config=_gravity(FOURTH_ORDER_CONSERVATIVE), **_SG), 1.5),
+        BenchmarkSpec("FD (Pallas)", _fd_pallas(gravity_config=_gravity(FOURTH_ORDER_CONSERVATIVE), **_SG), 1.5),
+        BenchmarkSpec("FV (JAX)", _fv(gravity_config=_gravity(SIMPLE_SOURCE), **_SG), 0.4),
     ]
 
 

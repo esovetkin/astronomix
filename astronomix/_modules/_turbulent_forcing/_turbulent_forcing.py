@@ -159,8 +159,128 @@ def _create_solenoidal_field(key, config, k_f):
 
 
 @partial(jax.jit, static_argnames=["config"])
+def _create_solenoidal_spectrum(key, config, k_f):
+    """A fresh solenoidal random forcing *spectrum* on the coarse synthesis
+    grid (``nc = config.turbulent_forcing_config.synthesis_resolution``),
+    Hermitian-symmetrised so its inverse DFT is real, and normalised to unit
+    real-space rms via Parseval's theorem.
+
+    Mathematically identical to the field produced by
+    :func:`_create_solenoidal_field` restricted to the coarse band limit --
+    the construction (power spectrum, k = 0 removal, solenoidal projection,
+    unit-rms normalisation) is the same, but only ``nc^3`` arrays are ever
+    touched, so the draw stays cheap and fully replicated across devices.
+    """
+    nc = config.turbulent_forcing_config.synthesis_resolution
+
+    kx = 2.0 * jnp.pi * jnp.fft.fftfreq(nc, d=config.box_size.x / nc)
+    ky = 2.0 * jnp.pi * jnp.fft.fftfreq(nc, d=config.box_size.y / nc)
+    kz = 2.0 * jnp.pi * jnp.fft.fftfreq(nc, d=config.box_size.z / nc)
+    kx_3d = kx.reshape(nc, 1, 1)
+    ky_3d = ky.reshape(1, nc, 1)
+    kz_3d = kz.reshape(1, 1, nc)
+    k_squared = kx_3d ** 2 + ky_3d ** 2 + kz_3d ** 2
+    kk = jnp.sqrt(k_squared)
+
+    # The spectrum k^6 exp(-8 k / kpk) peaks at k = 0.75 kpk, so set kpk =
+    # k_f / 0.75 to place the peak at the requested forcing wavenumber k_f.
+    kpk = k_f / 0.75
+    Pk = kk ** 6 * jnp.exp(-8.0 * kk / kpk)
+
+    key, sk1, sk2 = jax.random.split(key, 3)
+    raw = jax.random.normal(sk1, shape=(3, nc, nc, nc)) + \
+        1j * jax.random.normal(sk2, shape=(3, nc, nc, nc))
+    cwx = jnp.sqrt(Pk) * raw[0]
+    cwy = jnp.sqrt(Pk) * raw[1]
+    cwz = jnp.sqrt(Pk) * raw[2]
+    cwx = cwx.at[0, 0, 0].set(0.0 + 0.0j)
+    cwy = cwy.at[0, 0, 0].set(0.0 + 0.0j)
+    cwz = cwz.at[0, 0, 0].set(0.0 + 0.0j)
+
+    # Project out the compressible (curl-free) component to leave a solenoidal
+    # field.
+    k_squared_safe = jnp.where(k_squared == 0.0, 1.0, k_squared)
+    div_k = (kx_3d * cwx + ky_3d * cwy + kz_3d * cwz) / k_squared_safe
+    div_k = div_k.at[0, 0, 0].set(0.0 + 0.0j)
+    cwx = cwx - kx_3d * div_k
+    cwy = cwy - ky_3d * div_k
+    cwz = cwz - kz_3d * div_k
+    spectrum = jnp.stack([cwx, cwy, cwz])
+
+    # Hermitian-symmetrise, h(k) = (c(k) + conj(c(-k))) / 2, so that the
+    # inverse DFT is exactly real.  This equals taking jnp.real(ifftn(c)), the
+    # operation the full-grid path performs.  The (-k) index map in fft order
+    # is a flip followed by a one-slot roll along each spatial axis.
+    def _reflect(c):
+        for axis in (1, 2, 3):
+            c = jnp.roll(jnp.flip(c, axis=axis), shift=1, axis=axis)
+        return c
+
+    spectrum = 0.5 * (spectrum + jnp.conj(_reflect(spectrum)))
+
+    # Normalise to unit real-space rms.  By Parseval (with the 1/nc^3 inverse
+    # DFT convention), mean_x |w|^2 summed over components = sum_k |h_k|^2 /
+    # nc^6; the small epsilon guards an all-zero draw.
+    norm = jnp.sqrt(jnp.sum(jnp.abs(spectrum) ** 2) / float(nc) ** 6 + 1e-30)
+    return key, spectrum / norm
+
+
+@partial(jax.jit, static_argnames=["config"])
+def _synthesize_forcing_field(spectrum, config):
+    """Evaluate the coarse solenoidal forcing spectrum on the simulation grid.
+
+    The field is band-limited by construction, so evaluating its Fourier
+    series on the fine grid is *exact* -- no interpolation error.  It is done
+    as three per-axis inverse-DFT matrix products (einsums), which shard
+    cleanly under GSPMD: the large output axes follow the primitive state's
+    sharding, so each device only ever materialises its own shard.
+    """
+    nc = config.turbulent_forcing_config.synthesis_resolution
+    nx = config.num_cells.x + 2 * config.num_ghost_cells
+    ny = config.num_cells.y + 2 * config.num_ghost_cells
+    nz = config.num_cells.z + 2 * config.num_ghost_cells
+
+    # Integer mode numbers in fft order, shared by all axes of the coarse grid.
+    modes = jnp.fft.fftfreq(nc) * nc
+
+    def _dft_matrix(n_fine):
+        # Fine-grid sample positions as box fractions i / n_fine, matching the
+        # implicit sampling of jnp.fft.ifftn on the coarse grid.
+        positions = jnp.arange(n_fine) / n_fine
+        return jnp.exp(2j * jnp.pi * positions[:, None] * modes[None, :])
+
+    E_x = _dft_matrix(nx)
+    E_y = _dft_matrix(ny)
+    E_z = _dft_matrix(nz)
+
+    def _synthesize_component(coeffs):
+        w = jnp.einsum("xa,abc->xbc", E_x, coeffs)
+        w = jnp.einsum("yb,xbc->xyc", E_y, w)
+        w = jnp.einsum("zc,xyc->xyz", E_z, w)
+        # 1/nc^3: the inverse-DFT normalisation of the coarse grid.
+        return jnp.real(w) / float(nc) ** 3
+
+    return jnp.stack([
+        _synthesize_component(spectrum[0]),
+        _synthesize_component(spectrum[1]),
+        _synthesize_component(spectrum[2]),
+    ])
+
+
+@partial(jax.jit, static_argnames=["config"])
 def _init_ou_forcing_state(key, config, turbulent_forcing_params):
-    """Initial OU forcing state ``(key, f0)`` with f0 a stationary draw."""
+    """Initial OU forcing state ``(key, f0)`` with f0 a stationary draw.
+
+    With coarse spectral synthesis enabled, f0 is the coarse *spectrum* (the
+    OU update is linear, so evolving the spectrum and synthesising the field
+    each step is mathematically identical to evolving the real-space field);
+    otherwise it is the full-grid real-space field as before.
+    """
+    if config.turbulent_forcing_config.synthesis_resolution > 0:
+        key, spectrum = _create_solenoidal_spectrum(
+            key, config, turbulent_forcing_params.forcing_wavenumber
+        )
+        return (key, spectrum)
     key, field = _create_solenoidal_field(
         key, config, turbulent_forcing_params.forcing_wavenumber
     )
@@ -188,18 +308,28 @@ def _apply_ou_forcing(
     key, f = forcing_state
     tau_f = turbulent_forcing_params.correlation_time
     a = jnp.exp(-dt / tau_f)
-    key, xi = _create_solenoidal_field(
-        key, config, turbulent_forcing_params.forcing_wavenumber
-    )
+    use_spectral = config.turbulent_forcing_config.synthesis_resolution > 0
+    if use_spectral:
+        # The persistent OU state is the coarse spectrum; draw the fresh
+        # increment in spectral space too and synthesise the real-space
+        # acceleration only for this step's application.
+        key, xi = _create_solenoidal_spectrum(
+            key, config, turbulent_forcing_params.forcing_wavenumber
+        )
+    else:
+        key, xi = _create_solenoidal_field(
+            key, config, turbulent_forcing_params.forcing_wavenumber
+        )
     f = a * f + jnp.sqrt(jnp.maximum(1.0 - a ** 2, 0.0)) * xi
+    field = _synthesize_forcing_field(f, config) if use_spectral else f
 
     F0 = turbulent_forcing_params.forcing_amplitude
     vx_i = registered_variables.velocity_index.x
     vy_i = registered_variables.velocity_index.y
     vz_i = registered_variables.velocity_index.z
-    primitive_state = primitive_state.at[vx_i].add(F0 * f[0] * dt)
-    primitive_state = primitive_state.at[vy_i].add(F0 * f[1] * dt)
-    primitive_state = primitive_state.at[vz_i].add(F0 * f[2] * dt)
+    primitive_state = primitive_state.at[vx_i].add(F0 * field[0] * dt)
+    primitive_state = primitive_state.at[vy_i].add(F0 * field[1] * dt)
+    primitive_state = primitive_state.at[vz_i].add(F0 * field[2] * dt)
 
     # Conservative vacuum protection (HOW-MHD `prot`, called after forcing every
     # step in forc.f): neighbour-redistribute sub-threshold (vacuum) cells. This
