@@ -152,6 +152,8 @@ def _hydro_flux_div_axis_pallas(
             pallas_branch=_pallas_branch, native_branch=_native_branch,
         )
 
+    zero_halo = (0,) * ndim
+
     def _pallas_branch_acc(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
         return _pallas_call_sharded(
             lambda r, d: _hydro_flux_div_axis_pallas_local(
@@ -160,6 +162,15 @@ def _hydro_flux_div_axis_pallas(
             ),
             state_inputs=(rhs_in, dF_in),
             halo=halo,
+            # exchange only flux input
+            #
+            # _hydro_flux_div_axis_pallas_local uses rhs_in ->
+            # rhs_out_ref
+            # ...
+            #     rhs_out_ref[var, ...] = scale * rhs_in_ref[var, ...] + ...
+            # ...
+            # which is a local write
+            input_halos=(zero_halo, halo),
             block_shape=block_shape[:ndim],
         )
 

@@ -216,14 +216,98 @@ def _default_state_pspec(mesh, ndim) -> PartitionSpec:
     return PartitionSpec(*axis_names[: 1 + ndim])
 
 
+def _normalize_input_halos(input_halos, n_inputs: int, ndim: int):
+    """validate and normalize one halo tuple per input."""
+    if input_halos is None:
+        return None
+    if len(input_halos) != n_inputs:
+        raise ValueError("input_halos must match state_inputs")
+
+    out = []
+    # pad short tuples with zeros, truncate long tuples
+    # ndim == 3
+    #     (2,)      -> (2, 0, 0)
+    #     (2, 1)    -> (2, 1, 0)
+    #     (2, 1, 4) -> (2, 1, 4)
+    # ndim == 2
+    #     (2, 1, 4) -> (2, 1)
+    for halo in input_halos:
+        halo_n = tuple(int(x) for x in halo) + (0,) * max(0, ndim - len(halo))
+        halo_n = halo_n[:ndim]
+        if any(h < 0 for h in halo_n):
+            raise ValueError("input_halos must be non-negative")
+        out.append(halo_n)
+    return tuple(out)
+
+
+def _local_edge_pad(arr, width: int, axis: int, *, left: bool):
+    """creates local fake padding from edge values
+
+    this is used when a local pallas shape needs more halo padding than the input actually communicates
+    """
+    if width <= 0:
+        return None
+    size = arr.shape[axis]
+    if left:
+        edge = jax.lax.slice_in_dim(arr, 0, 1, axis=axis)
+    else:
+        edge = jax.lax.slice_in_dim(arr, size - 1, size, axis=axis)
+    reps = [1] * arr.ndim
+    reps[axis] = int(width)
+    return jnp.tile(edge, reps)
+
+
+def _pad_axis_with_input_halo(arr, axis, shape_h, comm_h, mesh_axis_name, num_dev):
+    """combines real communicated halo cells with fake local padding
+
+    shape_h = 4; comm_h = 4;
+        old behaviour, for real halo cells are exchanged on each side
+
+    shape_h = 4; comm_h = 0;
+        it exchanges nothing and fills the four left/right padded
+        cells by repeating the local edge values
+
+    shape_h = 4; comm_h = 1;
+        it exchanges one real neighbor cell and adds three local fake
+        padding cells on each side.
+
+    """
+    if comm_h > shape_h:
+        raise ValueError("input halo cannot exceed padded shape halo")
+
+    pieces = []
+    fake_left = _local_edge_pad(arr, shape_h - comm_h, axis, left=True)
+    if fake_left is not None:
+        pieces.append(fake_left)
+
+    if comm_h > 0:
+        size = arr.shape[axis]
+        left_edge = jax.lax.slice_in_dim(arr, 0, comm_h, axis=axis)
+        right_edge = jax.lax.slice_in_dim(arr, size - comm_h, size, axis=axis)
+        left_perm = [(j, (j - 1) % num_dev) for j in range(num_dev)]
+        right_perm = [(j, (j + 1) % num_dev) for j in range(num_dev)]
+        left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=right_perm)
+        right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=left_perm)
+        pieces.extend((left_halo, arr, right_halo))
+    else:
+        pieces.append(arr)
+
+    fake_right = _local_edge_pad(arr, shape_h - comm_h, axis, left=False)
+    if fake_right is not None:
+        pieces.append(fake_right)
+
+    return jnp.concatenate(pieces, axis=axis)
+
+
 def _pallas_call_sharded(
-    kernel_build_fn,
-    state_inputs,
-    other_args=(),
-    *,
-    halo,
-    block_shape,
-    num_state_outputs: int = 1,
+        kernel_build_fn,
+        state_inputs,
+        other_args=(),
+        *,
+        halo,
+        block_shape,
+        num_state_outputs: int = 1,
+        input_halos=None,
 ):
     """Optionally wrap a Pallas-kernel build-and-call in ``shard_map``.
 
@@ -254,6 +338,11 @@ def _pallas_call_sharded(
             Number of state-shape outputs of ``kernel_build_fn`` (1 for
             most kernels; >1 for the CT staged kernels which return
             tuples of single-channel arrays).
+        input_halos:
+            Optional per-state-input natural halo widths. ``None`` preserves
+            the original behavior. When provided, every input is padded to the
+            same block-rounded shape halo, but only its requested natural halo
+            is exchanged with neighbours.
 
     Returns:
         Either ``kernel_build_fn(*state_inputs, *other_args)`` directly
@@ -279,7 +368,25 @@ def _pallas_call_sharded(
 
     block_3 = tuple(block_shape) + (1,) * max(0, 3 - len(block_shape))
     halo_3 = tuple(halo) + (0,) * max(0, 3 - len(halo))
-    halo_padded = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
+    requested_input_halos = _normalize_input_halos(
+        input_halos, len(state_inputs), ndim
+    )
+
+    # shape_halo: block-rounded halo used to shape the local arrays
+    # passed into the Pallas kernel
+    #
+    # comm_halos: are the real neighbor halo widths to exchange for
+    # each input
+    if requested_input_halos is None:
+        shape_halo = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
+        comm_halos = tuple(shape_halo for _ in state_inputs)
+    else:
+        max_halo = tuple(
+            max([int(halo_3[ax])] + [h[ax] for h in requested_input_halos])
+            for ax in range(ndim)
+        )
+        shape_halo = _round_halo_up_to_block(max_halo, block_3[:ndim])
+        comm_halos = requested_input_halos
 
     try:
         from jax.shard_map import shard_map  # jax >= 0.8 (promoted out of experimental)
@@ -292,30 +399,22 @@ def _pallas_call_sharded(
 
         for array_axis_idx, mesh_axis_name, num_dev in sharded_axes:
             spatial_idx = array_axis_idx - 1
-            if spatial_idx >= len(halo_padded):
+            if spatial_idx >= len(shape_halo):
                 continue
-            h = halo_padded[spatial_idx]
+            h = shape_halo[spatial_idx]
             if h <= 0:
                 continue
-            left_perm = [(j, (j - 1) % num_dev) for j in range(num_dev)]
-            right_perm = [(j, (j + 1) % num_dev) for j in range(num_dev)]
+            # without fake padding equivalent:
+            #     for i, arr in enumerate(state_arrays):
+            #         left_edge = slice local left edge
+            #         right_edge = slice local right edge
+            #         left_halo = ppermute(right_edge)
+            #         right_halo = ppermute(left_edge)
+            #         state_arrays[i] = concatenate([left_halo, arr, right_halo])
             for i, arr in enumerate(state_arrays):
-                size = arr.shape[array_axis_idx]
-                left_edge = jax.lax.slice_in_dim(arr, 0, h, axis=array_axis_idx)
-                right_edge = jax.lax.slice_in_dim(
-                    arr, size - h, size, axis=array_axis_idx
-                )
-                # Each device sends its right edge to the right neighbour;
-                # the receiving device installs the inbound payload as its
-                # *left* halo.  Symmetric pattern for the right halo.
-                left_halo = jax.lax.ppermute(
-                    right_edge, mesh_axis_name, perm=right_perm
-                )
-                right_halo = jax.lax.ppermute(
-                    left_edge, mesh_axis_name, perm=left_perm
-                )
-                state_arrays[i] = jnp.concatenate(
-                    [left_halo, arr, right_halo], axis=array_axis_idx
+                comm_h = comm_halos[i][spatial_idx]
+                state_arrays[i] = _pad_axis_with_input_halo(
+                    arr, array_axis_idx, h, comm_h, mesh_axis_name, num_dev
                 )
 
         # Re-enter the wrapper with mesh=None so the recursive
@@ -328,9 +427,9 @@ def _pallas_call_sharded(
         def _strip(o):
             for array_axis_idx, _, _ in sharded_axes:
                 spatial_idx = array_axis_idx - 1
-                if spatial_idx >= len(halo_padded):
+                if spatial_idx >= len(shape_halo):
                     continue
-                h = halo_padded[spatial_idx]
+                h = shape_halo[spatial_idx]
                 if h <= 0:
                     continue
                 size = o.shape[array_axis_idx]

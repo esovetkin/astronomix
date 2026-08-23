@@ -146,6 +146,8 @@ def _ct_update_cell_center_fields_pallas(
     ndim = int(config.dimensionality)
     _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
     b_stacked = jnp.stack([bx_interface, by_interface, bz_interface])
+    b_halo = (3, 3, 3)[:ndim]
+    zero_halo = (0,) * ndim
 
     def _local(state_local, b_local):
         return _ct_update_cell_center_fields_pallas_local(
@@ -155,7 +157,21 @@ def _ct_update_cell_center_fields_pallas(
     return _pallas_call_sharded(
         _local,
         state_inputs=(conserved_state, b_stacked),
-        halo=(3, 3, 3)[:ndim],
+        halo=b_halo,
+        # exchange only magnetic interface
+        #
+        # _ct_update_cell_center_fields_pallas_local uses
+        # conserved_state -> q_ref
+        # ...
+        #     Bx_old = q_ref[BX, ii, jj, kk]
+        #     By_old = q_ref[BY, ii, jj, kk]
+        #     Bz_old = q_ref[BZ, ii, jj, kk]
+        # ...
+        #     E_old = q_ref[E, ii, jj, kk]
+        # ...
+        #         out_ref[var, ...] = q_ref[var, ii, jj, kk]
+        # which are all local reads
+        input_halos=(zero_halo, b_halo),
         block_shape=block[:ndim],
     )
 
@@ -308,6 +324,8 @@ def _ct_modified_flux_pallas(
     """
     ndim = int(config.dimensionality)
     _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
+    q_halo = (2, 2, 2)[:ndim]
+    zero_halo = (0,) * ndim
 
     def _local(state_local, flux_local):
         return _ct_modified_flux_pallas_local(
@@ -317,7 +335,21 @@ def _ct_modified_flux_pallas(
     return _pallas_call_sharded(
         _local,
         state_inputs=(conserved_state, flux_slices),
-        halo=(2, 2, 2)[:ndim],
+        halo=q_halo,
+        # exchange only conserved state
+        #
+        # _ct_modified_flux_pallas_local uses flux_slices -> f_ref
+        #
+        # ...
+        #     out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvy_at_x)
+        #     out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_x)
+        #     out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_y)
+        #     out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvz_at_y)
+        #     out_ref[4, ...] = f_ref[4, ii, jj, kk] + c2f(Bvx_at_z)
+        #     out_ref[5, ...] = f_ref[5, ii, jj, kk] + c2f(Bvy_at_z)
+        # ...
+        # which are all local reads
+        input_halos=(q_halo, zero_halo),
         block_shape=block[:ndim],
     )
 

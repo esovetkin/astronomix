@@ -4416,4 +4416,3 @@ def _weno_flux_hydro_pallas_rhs_local(
         name=f"hydro_weno_rhs_axis_{axis}",
         **kwargs,
     )(*kernel_args)
-
