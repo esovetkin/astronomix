@@ -725,23 +725,27 @@ def _lsrk4_with_ct(
             rhs_q_for_phys = -dtdx * (dF_x - _shift(dF_x, 1, axis=1))
         del dF_x, dF_x_halo
 
-        # Serialize the per-axis flux passes.  ``dF_{x,y,z}`` each depend only
-        # on ``current_q`` (not on ``dq`` or each other), so without an explicit
-        # dependency XLA is free to schedule all three axis reconstructions —
-        # and their halo-padded copies of the 8-var flux and the full state —
-        # concurrently, tripling the transient peak.  Routing ``current_q`` into
-        # the next axis *through* the just-updated accumulator forces the x-axis
-        # flux buffer to be freed before the y-axis one is built, holding a
-        # single axis live at a time.  ``optimization_barrier`` is a numerical
-        # no-op (bit-identical output); at production grid sizes each axis kernel
-        # already saturates the GPU, so the lost cross-axis overlap costs no
-        # throughput while cutting the RHS peak footprint ~3x.
-        if use_pallas_div:
-            current_q, dq = jax.lax.optimization_barrier((current_q, dq))
-        else:
-            current_q, rhs_q_for_phys = jax.lax.optimization_barrier(
-                (current_q, rhs_q_for_phys)
-            )
+        # I also thought that this should it should help with overlap,
+        # but experiments showed that it actually hurt the performance
+        # and scaling by about 1%
+        #
+        # # Serialize the per-axis flux passes.  ``dF_{x,y,z}`` each depend only
+        # # on ``current_q`` (not on ``dq`` or each other), so without an explicit
+        # # dependency XLA is free to schedule all three axis reconstructions —
+        # # and their halo-padded copies of the 8-var flux and the full state —
+        # # concurrently, tripling the transient peak.  Routing ``current_q`` into
+        # # the next axis *through* the just-updated accumulator forces the x-axis
+        # # flux buffer to be freed before the y-axis one is built, holding a
+        # # single axis live at a time.  ``optimization_barrier`` is a numerical
+        # # no-op (bit-identical output); at production grid sizes each axis kernel
+        # # already saturates the GPU, so the lost cross-axis overlap costs no
+        # # throughput while cutting the RHS peak footprint ~3x.
+        # if use_pallas_div:
+        #     current_q, dq = jax.lax.optimization_barrier((current_q, dq))
+        # else:
+        #     current_q, rhs_q_for_phys = jax.lax.optimization_barrier(
+        #         (current_q, rhs_q_for_phys)
+        #     )
 
         if config.dimensionality >= 2:
             mx = registered_variables.magnetic_index.x
@@ -757,13 +761,13 @@ def _lsrk4_with_ct(
                 rhs_q_for_phys = rhs_q_for_phys - dtdy * (dF_y - _shift(dF_y, 1, axis=2))
             del dF_y
 
-            # Same serialization barrier between the y and z axes (see above).
-            if use_pallas_div:
-                current_q, dq = jax.lax.optimization_barrier((current_q, dq))
-            else:
-                current_q, rhs_q_for_phys = jax.lax.optimization_barrier(
-                    (current_q, rhs_q_for_phys)
-                )
+            # # Same serialization barrier between the y and z axes (see above).
+            # if use_pallas_div:
+            #     current_q, dq = jax.lax.optimization_barrier((current_q, dq))
+            # else:
+            #     current_q, rhs_q_for_phys = jax.lax.optimization_barrier(
+            #         (current_q, rhs_q_for_phys)
+            #     )
         else:
             Bx_flux_y = 0.0
             Bz_flux_y = 0.0
