@@ -37,6 +37,9 @@ from astronomix._fluid_equations._enforce_positivity import (
 )
 from astronomix._finite_difference._interface_fluxes._weno import (
     _hydro_pallas_flux_supported,
+    _mhd_pallas_flux_supported,
+    _weno_flux_mhd_pallas_keep_halo_x,
+    _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
     _weno_flux_x,
     _weno_flux_y,
     _weno_flux_z,
@@ -47,10 +50,15 @@ from astronomix._finite_difference._interface_fluxes._flux_blending import (
 from astronomix._finite_difference._time_integrators._ssprk_pallas import (
     _div_axis_pallas_shape_ok,
     _hydro_flux_div_axis_pallas,
+    _hydro_flux_div_axis_native_from_kept_halo_sharded,
 )
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     _constrained_transport_rhs_from_slices,
     update_cell_center_fields,
+)
+from astronomix._finite_difference._magnetic_update._constrained_transport_pallas import (
+    _ct_rhs_pallas_supported,
+    _ct_rhs_pallas_x_precomputed,
 )
 from astronomix._geometry.boundaries import _boundary_handler
 from astronomix._integrators._explicit_rk import lsrk4, ssprk4
@@ -92,6 +100,19 @@ def _ssprk4_with_ct(
     use_pallas_div = (
         _backend_is_pallas(config) and pl is not None
         and _div_axis_pallas_shape_ok(conserved_state, config)
+    )
+
+    # special x-axis mhd weno only for multigpu and palas. single GPU
+    # use and old path
+    use_kept_x_flux_halo = (
+        use_pallas_div
+        and int(config.dimensionality) == 3
+        and jax.device_count() > 1
+        and _mhd_pallas_flux_supported(conserved_state, config)
+    )
+    use_ct_x_precomputed = (
+        use_kept_x_flux_halo
+        and _ct_rhs_pallas_supported(conserved_state, config)
     )
 
     def rhs(u, dt_tilde):
@@ -620,6 +641,19 @@ def _lsrk4_with_ct(
         and _div_axis_pallas_shape_ok(conserved_state, config)
     )
 
+    # special x-axis mhd weno only for multigpu and palas. single GPU
+    # use and old path
+    use_kept_x_flux_halo = (
+        use_pallas_div
+        and int(config.dimensionality) == 3
+        and jax.device_count() > 1
+        and _mhd_pallas_flux_supported(conserved_state, config)
+    )
+    use_ct_x_precomputed = (
+        use_kept_x_flux_halo
+        and _ct_rhs_pallas_supported(conserved_state, config)
+    )
+
     dtdx = dt / grid_spacing
     dtdy = dt / grid_spacing
     dtdz = dt / grid_spacing
@@ -653,11 +687,33 @@ def _lsrk4_with_ct(
         # first axis's div kernel via ``scale_in`` so ``rhs_q`` is never
         # materialised; subsequent axes accumulate (scale_in = 1.0).  The
         # native fallback path keeps the explicit ``rhs_q`` register.
-        dF_x = _weno_flux_x(current_q, params, config, registered_variables)
+        flux_x_mod = None
+        if use_ct_x_precomputed:
+            dF_x_halo, dF_x, flux_x_mod = _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
+                current_q, params, config, registered_variables
+            )
+        elif use_kept_x_flux_halo:
+            dF_x_halo, dF_x = _weno_flux_mhd_pallas_keep_halo_x(
+                current_q, params, config, registered_variables
+            )
+        else:
+            dF_x = _weno_flux_x(current_q, params, config, registered_variables)
+            dF_x_halo = None
         By_flux_x = dF_x[my]
         Bz_flux_x = dF_x[mz]
         density_flux_x = dF_x[di]
-        if use_pallas_div:
+        if use_kept_x_flux_halo:
+            dq = _hydro_flux_div_axis_native_from_kept_halo_sharded(
+                dF_x_halo,
+                dtdx,
+                config,
+                axis=0,
+                rhs_accumulator=dq,
+                scale_in=a_coef,
+                kept_halo=1,
+            )
+            rhs_q_for_phys = None
+        elif use_pallas_div:
             dq = _hydro_flux_div_axis_pallas(
                 dF_x, dtdx, config, axis=0,
                 rhs_accumulator=dq, scale_in=a_coef,
@@ -665,7 +721,7 @@ def _lsrk4_with_ct(
             rhs_q_for_phys = None
         else:
             rhs_q_for_phys = -dtdx * (dF_x - _shift(dF_x, 1, axis=1))
-        del dF_x
+        del dF_x, dF_x_halo
 
         # Serialize the per-axis flux passes.  ``dF_{x,y,z}`` each depend only
         # on ``current_q`` (not on ``dq`` or each other), so without an explicit
@@ -727,14 +783,25 @@ def _lsrk4_with_ct(
             Bx_flux_z = 0.0
             By_flux_z = 0.0
 
-        rhs_bx, rhs_by, rhs_bz = _constrained_transport_rhs_from_slices(
-            current_q,
-            By_flux_x, Bz_flux_x,
-            Bx_flux_y, Bz_flux_y,
-            Bx_flux_z, By_flux_z,
-            dtdx, dtdy, dtdz,
-            config, registered_variables,
-        )
+        if use_ct_x_precomputed:
+            rhs_bx, rhs_by, rhs_bz = _ct_rhs_pallas_x_precomputed(
+                current_q,
+                flux_x_mod[0], flux_x_mod[1],
+                Bx_flux_y, Bz_flux_y,
+                Bx_flux_z, By_flux_z,
+                dtdx, dtdy, dtdz,
+                config, registered_variables,
+            )
+        else:
+            rhs_bx, rhs_by, rhs_bz = _constrained_transport_rhs_from_slices(
+                current_q,
+                By_flux_x, Bz_flux_x,
+                Bx_flux_y, Bz_flux_y,
+                Bx_flux_z, By_flux_z,
+                dtdx, dtdy, dtdz,
+                config, registered_variables,
+            )
+        del flux_x_mod
 
         if config.dimensionality == 1:
             density_fluxes = (density_flux_x,)

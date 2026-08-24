@@ -190,6 +190,205 @@ def _hydro_flux_div_axis_pallas(
     )
 
 
+def _hydro_flux_div_axis_pallas_from_kept_halo(
+    dF,
+    dt_over_dx,
+    config: SimulationConfig,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in: Union[float, jnp.ndarray] = 1.0,
+    kept_halo: int = 1,
+):
+    if axis != 0:
+        raise RuntimeError("kept-halo divergence is only implemented for x")
+
+    ndim = int(config.dimensionality)
+    zero_halo = (0,) * ndim
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=rhs_accumulator.shape[1:],
+    )
+
+    def _pallas_branch(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
+        return _pallas_call_sharded(
+            lambda r, d: _hydro_flux_div_axis_pallas_from_kept_halo_local(
+                d,
+                dt_over_dx_in,
+                config,
+                axis=axis,
+                rhs_accumulator=r,
+                scale_in=scale_in_arr,
+                kept_halo=kept_halo,
+            ),
+            state_inputs=(rhs_in, dF_in),
+            halo=zero_halo,
+            # this ensures neither rhs_accumulator or dF is tranferred
+            #
+            # dF: already contains the one-cell x halo from weno-x
+            # rhs_accumulator: local writes only
+            input_halos=(zero_halo, zero_halo),
+            block_shape=block_shape[:ndim],
+        )
+
+    def _native_branch(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
+        return _hydro_flux_div_axis_from_kept_halo_native(
+            dF_in,
+            dt_over_dx_in,
+            axis=axis,
+            rhs_accumulator=rhs_in,
+            scale_in=scale_in_arr,
+            kept_halo=kept_halo,
+        )
+
+    return diffable_pallas_call_n(
+        (dF, dt_over_dx, rhs_accumulator, jnp.asarray(scale_in)),
+        pallas_branch=_pallas_branch,
+        native_branch=_native_branch,
+    )
+
+
+def _hydro_flux_div_axis_native_from_kept_halo_sharded(
+    dF,
+    dt_over_dx,
+    config: SimulationConfig,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in: Union[float, jnp.ndarray] = 1.0,
+    kept_halo: int = 1,
+):
+    if axis != 0:
+        raise RuntimeError("kept-halo native divergence is only implemented for x")
+
+    ndim = int(config.dimensionality)
+    zero_halo = (0,) * ndim
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=rhs_accumulator.shape[1:],
+    )
+
+    return _pallas_call_sharded(
+        lambda r, f: _hydro_flux_div_axis_from_kept_halo_native(
+            f,
+            dt_over_dx,
+            axis=axis,
+            rhs_accumulator=r,
+            scale_in=scale_in,
+            kept_halo=kept_halo,
+        ),
+        state_inputs=(rhs_accumulator, dF),
+        halo=zero_halo,
+        # this ensures neither rhs_accumulator or dF is tranferred
+        #
+        # dF: already contains the one-cell x halo from weno-x
+        # rhs_accumulator: local writes only
+        input_halos=(zero_halo, zero_halo),
+        block_shape=block_shape[:ndim],
+    )
+
+
+def _hydro_flux_div_axis_from_kept_halo_native(
+    dF,
+    dt_over_dx,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in,
+    kept_halo: int,
+):
+    """divergence is native JAX slicing
+
+    !!! this was measured to be faster than evaluation through pallas !!!
+
+    same communication path, fewer pallas boundaries
+    """
+    array_axis = axis + 1
+    n = rhs_accumulator.shape[array_axis]
+    right = jax.lax.slice_in_dim(
+        dF, kept_halo, kept_halo + n, axis=array_axis
+    )
+    left = jax.lax.slice_in_dim(
+        dF, kept_halo - 1, kept_halo - 1 + n, axis=array_axis
+    )
+    return scale_in * rhs_accumulator + (-dt_over_dx) * (right - left)
+
+
+def _hydro_flux_div_axis_pallas_from_kept_halo_local(
+    dF,
+    dt_over_dx,
+    config: SimulationConfig,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in: Union[float, jnp.ndarray],
+    kept_halo: int,
+):
+    ndim = int(config.dimensionality)
+    nvars = int(rhs_accumulator.shape[0])
+    spatial_shape = tuple(int(x) for x in rhs_accumulator.shape[1:])
+    nx, ny, nz = spatial_shape
+    bx, by, bz = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=spatial_shape,
+    )
+    grid = (nx // bx, ny // by, nz // bz)
+
+    block_shape = (nvars, bx, by, bz)
+    out_spec = pl.BlockSpec(block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
+    rhs_spec = pl.BlockSpec(block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
+    flux_spec = pl.BlockSpec(dF.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+
+    def kernel(rhs_in_ref, f_ref, dtdx_ref, scale_in_ref, rhs_out_ref):
+        bi = pl.program_id(0)
+        bj = pl.program_id(1)
+        bk = pl.program_id(2)
+
+        ii = bi * bx + jnp.arange(bx)[:, None, None]
+        jj = bj * by + jnp.arange(by)[None, :, None]
+        kk = bk * bz + jnp.arange(bz)[None, None, :]
+
+        dtdx = dtdx_ref[()]
+        scale = scale_in_ref[()]
+        offset = int(kept_halo)
+
+        for var in range(nvars):
+            rhs_out_ref[var, ...] = (
+                scale * rhs_in_ref[var, ...]
+                + (-dtdx)
+                * (
+                    f_ref[var, ii + offset, jj, kk]
+                    - f_ref[var, ii + offset - 1, jj, kk]
+                )
+            )
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+    kwargs["input_output_aliases"] = {0: 0}
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(rhs_accumulator.shape, rhs_accumulator.dtype),
+        grid=grid,
+        in_specs=[rhs_spec, flux_spec, scalar_spec, scalar_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name=f"hydro_flux_div_axis_{axis}_kept_halo_acc",
+        **kwargs,
+    )(
+        rhs_accumulator,
+        dF,
+        jnp.asarray(dt_over_dx, dtype=dF.dtype),
+        jnp.asarray(scale_in, dtype=dF.dtype),
+    )
+
+
 def _hydro_flux_div_axis_pallas_local(
     dF,
     dt_over_dx,

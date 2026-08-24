@@ -240,6 +240,40 @@ def _normalize_input_halos(input_halos, n_inputs: int, ndim: int):
     return tuple(out)
 
 
+def _normalize_output_halos(output_halo, n_outputs: int, ndim: int):
+    zero = (0,) * ndim
+    if output_halo is None:
+        return tuple(zero for _ in range(n_outputs))
+
+    if (
+        len(output_halo) == ndim
+        and all(isinstance(x, int) for x in output_halo)
+    ):
+        halos = tuple(output_halo for _ in range(n_outputs))
+    else:
+        if len(output_halo) != n_outputs:
+            raise ValueError("output_halo must match state outputs")
+        halos = tuple(output_halo)
+
+    out = []
+    # ndim == 3
+    #     (1,)      -> (1, 0, 0)
+    #     (1, 0)    -> (1, 0, 0)
+    #     (1, 0, 0) -> (1, 0, 0)
+    #
+    # ndim == 2
+    #     (1,)      -> (1, 0)
+    #     (1, 0)    -> (1, 0)
+    #     (1, 0, 4) -> (1, 0)
+    for halo in halos:
+        halo_n = tuple(int(x) for x in halo) + (0,) * max(0, ndim - len(halo))
+        halo_n = halo_n[:ndim]
+        if any(h < 0 for h in halo_n):
+            raise ValueError("output_halo must be non-negative")
+        out.append(halo_n)
+    return tuple(out)
+
+
 def _local_edge_pad(arr, width: int, axis: int, *, left: bool):
     """creates local fake padding from edge values
 
@@ -308,6 +342,7 @@ def _pallas_call_sharded(
         block_shape,
         num_state_outputs: int = 1,
         input_halos=None,
+        output_halo=None,
 ):
     """Optionally wrap a Pallas-kernel build-and-call in ``shard_map``.
 
@@ -343,6 +378,11 @@ def _pallas_call_sharded(
             the original behavior. When provided, every input is padded to the
             same block-rounded shape halo, but only its requested natural halo
             is exchanged with neighbours.
+        output_halo:
+            Optional natural halo width to keep on state-shaped outputs. The
+            default strips all padded cells. Keeping a small output halo lets a
+            following local stencil consume halo data that this kernel already
+            computed, avoiding another exchange.
 
     Returns:
         Either ``kernel_build_fn(*state_inputs, *other_args)`` directly
@@ -377,6 +417,9 @@ def _pallas_call_sharded(
     #
     # comm_halos: are the real neighbor halo widths to exchange for
     # each input
+    kept_output_halos = _normalize_output_halos(
+        output_halo, int(num_state_outputs), ndim
+    )
     if requested_input_halos is None:
         shape_halo = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
         comm_halos = tuple(shape_halo for _ in state_inputs)
@@ -387,6 +430,11 @@ def _pallas_call_sharded(
         )
         shape_halo = _round_halo_up_to_block(max_halo, block_3[:ndim])
         comm_halos = requested_input_halos
+
+    for kept_halo in kept_output_halos:
+        for kept, shaped in zip(kept_halo, shape_halo, strict=False):
+            if kept > shaped:
+                raise ValueError("output_halo cannot exceed padded shape halo")
 
     try:
         from jax.shard_map import shard_map  # jax >= 0.8 (promoted out of experimental)
@@ -413,6 +461,8 @@ def _pallas_call_sharded(
             #         state_arrays[i] = concatenate([left_halo, arr, right_halo])
             for i, arr in enumerate(state_arrays):
                 comm_h = comm_halos[i][spatial_idx]
+                # Fake cells fill block-rounded shape padding only. Callers may
+                # request comm_h < h when kept outputs never read those cells.
                 state_arrays[i] = _pad_axis_with_input_halo(
                     arr, array_axis_idx, h, comm_h, mesh_axis_name, num_dev
                 )
@@ -424,21 +474,25 @@ def _pallas_call_sharded(
         with pallas_mesh_context(None):
             out = kernel_build_fn(*state_arrays, *others)
 
-        def _strip(o):
+        def _strip(o, kept_halo):
             for array_axis_idx, _, _ in sharded_axes:
                 spatial_idx = array_axis_idx - 1
                 if spatial_idx >= len(shape_halo):
                     continue
                 h = shape_halo[spatial_idx]
-                if h <= 0:
+                keep = kept_halo[spatial_idx]
+                strip = h - keep
+                if strip <= 0:
                     continue
                 size = o.shape[array_axis_idx]
-                o = jax.lax.slice_in_dim(o, h, size - h, axis=array_axis_idx)
+                o = jax.lax.slice_in_dim(
+                    o, strip, size - strip, axis=array_axis_idx
+                )
             return o
 
         if isinstance(out, tuple):
-            return tuple(_strip(o) for o in out)
-        return _strip(out)
+            return tuple(_strip(o, h) for o, h in zip(out, kept_output_halos, strict=True))
+        return _strip(out, kept_output_halos[0])
 
     state_specs = tuple(pspec for _ in state_inputs)
     other_specs = tuple(PartitionSpec() for _ in other_args)

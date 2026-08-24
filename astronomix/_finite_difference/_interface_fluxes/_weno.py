@@ -518,6 +518,8 @@ from astronomix._finite_difference._interface_fluxes._weno_pallas import (  # no
     _weno_flux_hydro_pallas_rhs,
     _weno_flux_mhd_iso_pallas,
     _weno_flux_mhd_pallas,
+    _weno_flux_mhd_pallas_keep_halo_x,
+    _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
 )
 
 

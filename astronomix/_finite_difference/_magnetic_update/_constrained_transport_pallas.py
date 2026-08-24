@@ -171,6 +171,8 @@ def _ct_update_cell_center_fields_pallas(
         # ...
         #         out_ref[var, ...] = q_ref[var, ii, jj, kk]
         # which are all local reads
+        #
+        # b_halo ranges between -3 and +2 for all directions
         input_halos=(zero_halo, b_halo),
         block_shape=block[:ndim],
     )
@@ -342,13 +344,10 @@ def _ct_modified_flux_pallas(
         #
         # ...
         #     out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvy_at_x)
-        #     out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_x)
-        #     out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_y)
-        #     out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvz_at_y)
-        #     out_ref[4, ...] = f_ref[4, ii, jj, kk] + c2f(Bvx_at_z)
-        #     out_ref[5, ...] = f_ref[5, ii, jj, kk] + c2f(Bvy_at_z)
         # ...
         # which are all local reads
+        #
+        # conserved_state is read in -1 .. 2 range
         input_halos=(q_halo, zero_halo),
         block_shape=block[:ndim],
     )
@@ -453,9 +452,128 @@ def _ct_modified_flux_pallas_local(
     )(conserved_state, flux_slices)
 
 
+def _ct_modified_flux_yz_pallas(
+    conserved_state,
+    flux_yz_slices,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    ndim = int(config.dimensionality)
+    _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
+    q_halo = (0, 2, 2)[:ndim]
+    zero_halo = (0,) * ndim
+
+    def _local(state_local, flux_local):
+        return _ct_modified_flux_yz_pallas_local(
+            state_local, flux_local, config, registered_variables
+        )
+
+    return _pallas_call_sharded(
+        _local,
+        state_inputs=(conserved_state, flux_yz_slices),
+        halo=q_halo,
+        # exchange only conserved state
+        #
+        # _ct_modified_flux_yz_pallas_local uses
+        #         flux_yz_slices -> f_ref
+        # ...
+        #     out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvx_at_y)
+        #     out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_y)
+        #     out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_z)
+        #     out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvy_at_z)
+        # ...
+        # which are all local reads, and
+        #
+        #         conserved_state -> q_ref, with stensil walk in j,k
+        #         dimensions:
+        # ...
+        #     rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
+        #     return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MX, ii, (jj + off) % ny, kk] / rho
+        # ...
+        #  where is read at `qref[.*, ii, .*]`, with the `ii` index is
+        #  local, and off between -1 and 2
+        input_halos=(q_halo, zero_halo),
+        block_shape=block[:ndim],
+    )
+
+
+def _ct_modified_flux_yz_pallas_local(
+    conserved_state,
+    flux_yz_slices,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
+        conserved_state.shape[1:], config
+    )
+
+    DENSITY = int(registered_variables.density_index)
+    MX = int(registered_variables.momentum_index.x)
+    MY = int(registered_variables.momentum_index.y)
+    MZ = int(registered_variables.momentum_index.z)
+    BY = int(registered_variables.magnetic_index.y)
+    BZ = int(registered_variables.magnetic_index.z)
+
+    state_spec = pl.BlockSpec(conserved_state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    flux_in_spec = pl.BlockSpec(flux_yz_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((4, bx_blk, by_blk, bz_blk),
+                            lambda bi, bj, bk: (0, bi, bj, bk))
+
+    def kernel(q_ref, f_ref, out_ref):
+        bi = pl.program_id(0)
+        bj = pl.program_id(1)
+        bk = pl.program_id(2)
+        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
+        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
+        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+
+        def Bvx_at_y(off):
+            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
+            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MX, ii, (jj + off) % ny, kk] / rho
+
+        def Bvz_at_y(off):
+            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
+            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MZ, ii, (jj + off) % ny, kk] / rho
+
+        def Bvx_at_z(off):
+            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
+            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MX, ii, jj, (kk + off) % nz] / rho
+
+        def Bvy_at_z(off):
+            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
+            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MY, ii, jj, (kk + off) % nz] / rho
+
+        def c2f(prod):
+            return (-prod(-1) + 9.0 * prod(0) + 9.0 * prod(1) - prod(2)) / 16.0
+
+        out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvx_at_y)
+        out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_y)
+        out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_z)
+        out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvy_at_z)
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(flux_yz_slices.shape, flux_yz_slices.dtype),
+        grid=grid,
+        in_specs=[state_spec, flux_in_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_modified_flux_yz",
+        **kwargs,
+    )(conserved_state, flux_yz_slices)
+
+
 def _ct_edge_emf_pallas(flux_mod_slices, config: SimulationConfig):
     """Stage 2 public wrapper: edge EMFs from the stacked modified
     fluxes.  Halo 2 (center-to-face stencil along two axes per output)."""
+    if jax.device_count() > 1:
+        return _ct_edge_emf_pallas_split_x(flux_mod_slices, config)
+
     ndim = int(config.dimensionality)
     _, block, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
 
@@ -547,9 +665,182 @@ def _ct_edge_emf_pallas_local(flux_mod_slices, config: SimulationConfig):
     )(flux_mod_slices)
 
 
+def _ct_edge_emf_pallas_split_x(flux_mod_slices, config: SimulationConfig):
+    ndim = int(config.dimensionality)
+    _, block, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
+    emf_halo = (2, 2, 2)[:ndim]
+    xfree_halo = (0, 2, 2)[:ndim]
+
+    flux_xline = jnp.stack([flux_mod_slices[2], flux_mod_slices[4]])
+    flux_yzline = jnp.stack([flux_mod_slices[0], flux_mod_slices[1]])
+    flux_xfree = jnp.stack([flux_mod_slices[3], flux_mod_slices[5]])
+
+    # two branches: one requires some communication (omega_zy) and
+    # another one is a pure local computation branch (omega_x), so
+    # that XLA has a cleaner graph, so there is a better chance to do
+    # some compute together with communication
+
+    omega_zy = _pallas_call_sharded(
+        lambda flux_x_local, flux_yz_local: _ct_edge_emf_xdep_pallas_local(
+            flux_x_local, flux_yz_local, config
+        ),
+        state_inputs=(flux_xline, flux_yzline),
+        halo=emf_halo,
+        # _ct_edge_emf_xdep_pallas_local:
+        #
+        #     flux_xline -> fx_ref:
+        #     only shifts in i dimension, with shifts between -1 .. 2
+        #
+        #     flux_yzline -> fyz_ref:
+        #     only shifts in j,k dimensions, with shifts between -1 .. 2
+        input_halos=((2, 0, 0)[:ndim], xfree_halo),
+        block_shape=block[:ndim],
+    )
+
+    # for (1, G, 1, 1) shards, `omega_x` is a local-only computation
+    omega_x = _pallas_call_sharded(
+        lambda flux_local: _ct_edge_emf_xfree_pallas_local(flux_local, config),
+        state_inputs=(flux_xfree,),
+        halo=xfree_halo,
+        # _ct_edge_emf_xfree_pallas_local: flux_xfree -> f_ref
+        #
+        # ...
+        #     f_ref uses only j and k dimensions shifts between -1 .. 2
+        #     f_ref[..., ii, ...]
+        # ...
+        # which is local in x dimension
+        input_halos=(xfree_halo,),
+        block_shape=block[:ndim],
+    )
+    return jnp.stack([omega_zy[0], omega_x[0], omega_zy[1]])
+
+
+def _ct_edge_emf_xdep_pallas_local(flux_xline, flux_yzline, config: SimulationConfig):
+    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
+        flux_xline.shape[1:], config
+    )
+
+    xline_spec = pl.BlockSpec(flux_xline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    yzline_spec = pl.BlockSpec(flux_yzline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((2, bx_blk, by_blk, bz_blk),
+                            lambda bi, bj, bk: (0, bi, bj, bk))
+
+    def kernel(fx_ref, fyz_ref, out_ref):
+        bi = pl.program_id(0)
+        bj = pl.program_id(1)
+        bk = pl.program_id(2)
+        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
+        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
+        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+
+        def c2f_x(ch):
+            return (
+                -fx_ref[ch, (ii - 1) % nx, jj, kk]
+              + 9.0 * fx_ref[ch, ii, jj, kk]
+              + 9.0 * fx_ref[ch, (ii + 1) % nx, jj, kk]
+              - fx_ref[ch, (ii + 2) % nx, jj, kk]
+            ) / 16.0
+
+        def c2f_y(ch):
+            return (
+                -fyz_ref[ch, ii, (jj - 1) % ny, kk]
+              + 9.0 * fyz_ref[ch, ii, jj, kk]
+              + 9.0 * fyz_ref[ch, ii, (jj + 1) % ny, kk]
+              - fyz_ref[ch, ii, (jj + 2) % ny, kk]
+            ) / 16.0
+
+        def c2f_z(ch):
+            return (
+                -fyz_ref[ch, ii, jj, (kk - 1) % nz]
+              + 9.0 * fyz_ref[ch, ii, jj, kk]
+              + 9.0 * fyz_ref[ch, ii, jj, (kk + 1) % nz]
+              - fyz_ref[ch, ii, jj, (kk + 2) % nz]
+            ) / 16.0
+
+        out_ref[0, ...] = c2f_x(0) - c2f_y(0)
+        out_ref[1, ...] = c2f_z(1) - c2f_x(1)
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+
+    out_shape = jax.ShapeDtypeStruct(
+        (2,) + tuple(flux_xline.shape[1:]), flux_xline.dtype
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[xline_spec, yzline_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_edge_emf_xdep",
+        **kwargs,
+    )(flux_xline, flux_yzline)
+
+
+def _ct_edge_emf_xfree_pallas_local(flux_mod_slices, config: SimulationConfig):
+    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
+        flux_mod_slices.shape[1:], config
+    )
+
+    field_spec = pl.BlockSpec(flux_mod_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((1, bx_blk, by_blk, bz_blk),
+                            lambda bi, bj, bk: (0, bi, bj, bk))
+
+    def kernel(f_ref, out_ref):
+        bi = pl.program_id(0)
+        bj = pl.program_id(1)
+        bk = pl.program_id(2)
+        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
+        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
+        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+
+        def c2f_y(ch):
+            return (
+                -f_ref[ch, ii, (jj - 1) % ny, kk]
+              + 9.0 * f_ref[ch, ii, jj, kk]
+              + 9.0 * f_ref[ch, ii, (jj + 1) % ny, kk]
+              - f_ref[ch, ii, (jj + 2) % ny, kk]
+            ) / 16.0
+
+        def c2f_z(ch):
+            return (
+                -f_ref[ch, ii, jj, (kk - 1) % nz]
+              + 9.0 * f_ref[ch, ii, jj, kk]
+              + 9.0 * f_ref[ch, ii, jj, (kk + 1) % nz]
+              - f_ref[ch, ii, jj, (kk + 2) % nz]
+            ) / 16.0
+
+        out_ref[0, ...] = c2f_y(1) - c2f_z(0)
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+
+    out_shape = jax.ShapeDtypeStruct(
+        (1,) + tuple(flux_mod_slices.shape[1:]), flux_mod_slices.dtype
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[field_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_edge_emf_xfree",
+        **kwargs,
+    )(flux_mod_slices)
+
+
 def _ct_curl_pallas(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
     """Stage 3 public wrapper: smoothed 6th-order curl of the stacked
     edge EMFs.  Halo 4: FD6 reach 3 plus 1 for the fused PVA smoothing."""
+    if jax.device_count() > 1:
+        return _ct_curl_pallas_split_x(omega_slices, dtdx, dtdy, dtdz, config)
+
     ndim = int(config.dimensionality)
     _, block, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
 
@@ -569,6 +860,165 @@ def _ct_curl_pallas(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
         halo=(4, 4, 4)[:ndim],
         block_shape=block[:ndim],
     )
+
+
+def _ct_curl_pallas_split_x(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
+    ndim = int(config.dimensionality)
+    _, block, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
+    curl_halo = (4, 4, 4)[:ndim]
+    xfree_halo = (0, 4, 4)[:ndim]
+
+    omega_xdep = jnp.stack([omega_slices[0], omega_slices[2]])
+    omega_xfree = omega_slices[1:2]
+
+    def _local(omega_xdep_local, omega_xfree_local, dtdx_a, dtdy_a, dtdz_a):
+        return _ct_curl_split_x_pallas_local(
+            omega_xdep_local,
+            omega_xfree_local,
+            dtdx_a,
+            dtdy_a,
+            dtdz_a,
+            config,
+        )
+
+    return _pallas_call_sharded(
+        _local,
+        state_inputs=(omega_xdep, omega_xfree),
+        other_args=(
+            jnp.asarray(dtdx, dtype=omega_slices.dtype),
+            jnp.asarray(dtdy, dtype=omega_slices.dtype),
+            jnp.asarray(dtdz, dtype=omega_slices.dtype),
+        ),
+        halo=curl_halo,
+        # _ct_curl_split_x_pallas_local:
+        #     omega_xdep -> om_xdep_ref:
+        #         uses all directions
+        #         trace calls through fd6_x
+        #     omega_xfree -> om_xfree_ref:
+        #         for that case it's a bit less obvious, as
+        #         om_xfree_ref[..., (ii+ox)%nx, ...]
+        #             -> pva_yz_omx
+        #                 -> fd6_{y,z}
+        #                 which calls with ox == 0
+        input_halos=(curl_halo, xfree_halo),
+        block_shape=block[:ndim],
+    )
+
+
+def _ct_curl_split_x_pallas_local(
+    omega_xdep, omega_xfree, dtdx, dtdy, dtdz, config: SimulationConfig
+):
+    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
+        omega_xdep.shape[1:], config
+    )
+
+    xdep_spec = pl.BlockSpec(omega_xdep.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    xfree_spec = pl.BlockSpec(omega_xfree.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((3, bx_blk, by_blk, bz_blk),
+                            lambda bi, bj, bk: (0, bi, bj, bk))
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+
+    c1 = 75.0 / 64.0
+    c2 = -25.0 / 384.0
+    c3 = 3.0 / 640.0
+
+    def kernel(om_xdep_ref, om_xfree_ref, dtdx_ref, dtdy_ref, dtdz_ref, out_ref):
+        bi = pl.program_id(0)
+        bj = pl.program_id(1)
+        bk = pl.program_id(2)
+        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
+        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
+        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+
+        dtdx_v = dtdx_ref[()]
+        dtdy_v = dtdy_ref[()]
+        dtdz_v = dtdz_ref[()]
+
+        def pva_xy_omz(ox, oy, oz):
+            q_c = om_xdep_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
+            sx = (
+                om_xdep_ref[0, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
+              - 2.0 * q_c
+              + om_xdep_ref[0, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
+            ) / 24.0
+            sy = (
+                om_xdep_ref[0, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
+              - 2.0 * q_c
+              + om_xdep_ref[0, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
+            ) / 24.0
+            return q_c + sx + sy
+
+        def pva_yz_omx(ox, oy, oz):
+            q_c = om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
+            sy = (
+                om_xfree_ref[0, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
+              - 2.0 * q_c
+              + om_xfree_ref[0, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
+            ) / 24.0
+            sz = (
+                om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
+              - 2.0 * q_c
+              + om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
+            ) / 24.0
+            return q_c + sy + sz
+
+        def pva_xz_omy(ox, oy, oz):
+            q_c = om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
+            sx = (
+                om_xdep_ref[1, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
+              - 2.0 * q_c
+              + om_xdep_ref[1, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
+            ) / 24.0
+            sz = (
+                om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
+              - 2.0 * q_c
+              + om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
+            ) / 24.0
+            return q_c + sx + sz
+
+        def fd6_x(pva):
+            return (
+                c1 * (pva(0, 0, 0) - pva(-1, 0, 0))
+              + c2 * (pva(1, 0, 0) - pva(-2, 0, 0))
+              + c3 * (pva(2, 0, 0) - pva(-3, 0, 0))
+            )
+
+        def fd6_y(pva):
+            return (
+                c1 * (pva(0, 0, 0) - pva(0, -1, 0))
+              + c2 * (pva(0, 1, 0) - pva(0, -2, 0))
+              + c3 * (pva(0, 2, 0) - pva(0, -3, 0))
+            )
+
+        def fd6_z(pva):
+            return (
+                c1 * (pva(0, 0, 0) - pva(0, 0, -1))
+              + c2 * (pva(0, 0, 1) - pva(0, 0, -2))
+              + c3 * (pva(0, 0, 2) - pva(0, 0, -3))
+            )
+
+        out_ref[0, ...] = -dtdy_v * fd6_y(pva_xy_omz) + dtdz_v * fd6_z(pva_xz_omy)
+        out_ref[1, ...] = -dtdz_v * fd6_z(pva_yz_omx) + dtdx_v * fd6_x(pva_xy_omz)
+        out_ref[2, ...] = -dtdx_v * fd6_x(pva_xz_omy) + dtdy_v * fd6_y(pva_yz_omx)
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+
+    out_shape = jax.ShapeDtypeStruct(
+        (3,) + tuple(omega_xdep.shape[1:]), omega_xdep.dtype
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[xdep_spec, xfree_spec, scalar_spec, scalar_spec, scalar_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_curl_split_x",
+        **kwargs,
+    )(omega_xdep, omega_xfree, dtdx, dtdy, dtdz)
 
 
 def _ct_curl_pallas_local(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
@@ -736,6 +1186,40 @@ def _ct_rhs_pallas(
         conserved_state, flux_slices, config, registered_variables
     )
     del flux_slices
+    omega = _ct_edge_emf_pallas(flux_mod, config)
+    del flux_mod
+    rhs_b = _ct_curl_pallas(omega, dtdx, dtdy, dtdz, config)
+    return rhs_b[0], rhs_b[1], rhs_b[2]
+
+
+def _ct_rhs_pallas_x_precomputed(
+    conserved_state,
+    By_flux_x_interface_mod,
+    Bz_flux_x_interface_mod,
+    Bx_flux_y_interface,
+    Bz_flux_y_interface,
+    Bx_flux_z_interface,
+    By_flux_z_interface,
+    dtdx,
+    dtdy,
+    dtdz,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    assert _ct_rhs_pallas_supported(conserved_state, config)
+    flux_yz_slices = jnp.stack([
+        Bx_flux_y_interface, Bz_flux_y_interface,
+        Bx_flux_z_interface, By_flux_z_interface,
+    ])
+    flux_yz_mod = _ct_modified_flux_yz_pallas(
+        conserved_state, flux_yz_slices, config, registered_variables
+    )
+    del flux_yz_slices
+    flux_mod = jnp.concatenate([
+        jnp.stack([By_flux_x_interface_mod, Bz_flux_x_interface_mod]),
+        flux_yz_mod,
+    ], axis=0)
+    del flux_yz_mod
     omega = _ct_edge_emf_pallas(flux_mod, config)
     del flux_mod
     rhs_b = _ct_curl_pallas(omega, dtdx, dtdy, dtdz, config)

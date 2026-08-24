@@ -50,7 +50,7 @@ from astronomix._finite_difference._interface_fluxes._weno_weights import (
 )
 
 
-def _weno5_shard_wrap(kernel_local, conserved_state, config, axis):
+def _weno5_shard_wrap(kernel_local, conserved_state, config, axis, *, output_halo=None):
     """Multi-GPU wrap for a per-axis 5th-order WENO Pallas kernel.
 
     The WENO5 stencil reads offsets ``-2..+3`` along the *active* axis only —
@@ -78,6 +78,7 @@ def _weno5_shard_wrap(kernel_local, conserved_state, config, axis):
         state_inputs=(conserved_state,),
         halo=halo,
         block_shape=block_shape[:ndim],
+        output_halo=output_halo,
     )
 
 
@@ -1481,6 +1482,127 @@ def _weno_flux_mhd_pallas(
             state_local, params, config, registered_variables, axis=axis
         )
     return _weno5_shard_wrap(_local, conserved_state, config, axis)
+
+
+def _weno_flux_mhd_pallas_keep_halo_x(
+    conserved_state,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """_weno_flux_mhd_pallas(...) computes one flux array and returns it
+    with all sharded halo padding stripped.
+
+    This one does returns an extra flux that keeps 1x halo cell
+
+    - dF_x_halo used for divergence
+
+    - dF_x is for normal local consumers like CT magnetic flux slices
+      and density flux.
+
+    """
+    if not _mhd_pallas_flux_supported(conserved_state, config):
+        # no fallback to the native jax
+        raise RuntimeError(
+            "_weno_flux_mhd_pallas_keep_halo_x called when Pallas MHD WENO is unsupported."
+        )
+
+    ndim = int(config.dimensionality)
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=conserved_state.shape[1:],
+    )
+    # Why 3? The weno5 flux reconstruction reads a stencil along the
+    # active axis with reach up to 3 cells. Since this helper is
+    # x-only, only the x halo is needed.
+    halo = (3, 0, 0)
+
+    def _local(state_local):
+        flux = _weno_flux_mhd_pallas_local(
+            state_local, params, config, registered_variables, axis=0
+        )
+        return flux, flux
+
+    return _pallas_call_sharded(
+        _local,
+        state_inputs=(conserved_state,),
+        halo=halo,
+        block_shape=block_shape[:ndim],
+        # in `return flux, flux`, the two returned arrays are stripped
+        # differently
+        #
+        # flex_0: keep 1 x halo cell
+        # flex_1: strip all halo cells
+        num_state_outputs=2,
+        output_halo=((1, 0, 0), (0, 0, 0)),
+    )
+
+
+def _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
+    conserved_state,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """This does everything _weno_flux_mhd_pallas_keep_halo_x does,
+    plus it precomputes the two x-direction modified CT flux slices.
+    """
+    if not _mhd_pallas_flux_supported(conserved_state, config):
+        raise RuntimeError(
+            "_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod called when Pallas MHD WENO is unsupported."
+        )
+
+    ndim = int(config.dimensionality)
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=conserved_state.shape[1:],
+    )
+    halo = (3, 0, 0)
+    density = int(registered_variables.density_index)
+    mom_y = int(registered_variables.momentum_index.y)
+    mom_z = int(registered_variables.momentum_index.z)
+    mag_x = int(registered_variables.magnetic_index.x)
+    mag_y = int(registered_variables.magnetic_index.y)
+    mag_z = int(registered_variables.magnetic_index.z)
+
+    def _local(state_local):
+        flux = _weno_flux_mhd_pallas_local(
+            state_local, params, config, registered_variables, axis=0
+        )
+        rho = state_local[density]
+        bx = state_local[mag_x]
+        bx_vy = bx * state_local[mom_y] / rho
+        bx_vz = bx * state_local[mom_z] / rho
+
+        def c2f_x(a):
+            return (
+                -jnp.roll(a, 1, axis=0)
+                + 9.0 * a
+                + 9.0 * jnp.roll(a, -1, axis=0)
+                - jnp.roll(a, -2, axis=0)
+            ) / 16.0
+
+        flux_x_mod = jnp.stack([
+            flux[mag_y] + c2f_x(bx_vy),
+            flux[mag_z] + c2f_x(bx_vz),
+        ])
+        return flux, flux, flux_x_mod
+
+    return _pallas_call_sharded(
+        _local,
+        state_inputs=(conserved_state,),
+        halo=halo,
+        block_shape=block_shape[:ndim],
+        # return flux, flux, flux_x_mod
+        #
+        # flux_0: x WENO flux with one x halo, for x-divergence
+        # flux_1: normal x WENO flux, for local slices like density flux
+        # flux_x_mod: normal-shape precomputed CT x modified flux slices
+        num_state_outputs=3,
+        output_halo=((1, 0, 0), (0, 0, 0), (0, 0, 0)),
+    )
 
 
 def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
