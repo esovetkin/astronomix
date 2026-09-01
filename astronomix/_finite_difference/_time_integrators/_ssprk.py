@@ -38,8 +38,8 @@ from astronomix._fluid_equations._enforce_positivity import (
 from astronomix._finite_difference._interface_fluxes._weno import (
     _hydro_pallas_flux_supported,
     _mhd_pallas_flux_supported,
+    _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
     _weno_flux_mhd_pallas_keep_halo_x,
-    _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
     _weno_flux_x,
     _weno_flux_y,
     _weno_flux_z,
@@ -670,10 +670,6 @@ def _lsrk4_with_ct(
         we fall back to the explicit
         ``rhs_q`` → ``dq = a_coef * dq + rhs_q`` pattern.
         """
-        current_q = update_cell_center_fields(
-            current_q, bx, by, bz, config, registered_variables
-        )
-
         # Axis-incremental flow — see the matching SSPRK4-with-CT path
         # above for the rationale.  Each axis's full dF is built, the
         # two magnetic-flux slices CT needs are extracted, dF is consumed
@@ -689,16 +685,22 @@ def _lsrk4_with_ct(
         # native fallback path keeps the explicit ``rhs_q`` register.
         flux_x_mod = None
         if use_ct_x_precomputed:
-            dF_x_halo, dF_x, flux_x_mod = _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
-                current_q, params, config, registered_variables
-            )
-        elif use_kept_x_flux_halo:
-            dF_x_halo, dF_x = _weno_flux_mhd_pallas_keep_halo_x(
-                current_q, params, config, registered_variables
+            current_q, dF_x_halo, dF_x, flux_x_mod = (
+                _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
+                    current_q, bx, by, bz, params, config, registered_variables
+                )
             )
         else:
-            dF_x = _weno_flux_x(current_q, params, config, registered_variables)
-            dF_x_halo = None
+            current_q = update_cell_center_fields(
+                current_q, bx, by, bz, config, registered_variables
+            )
+            if use_kept_x_flux_halo:
+                dF_x_halo, dF_x = _weno_flux_mhd_pallas_keep_halo_x(
+                    current_q, params, config, registered_variables
+                )
+            else:
+                dF_x = _weno_flux_x(current_q, params, config, registered_variables)
+                dF_x_halo = None
         By_flux_x = dF_x[my]
         Bz_flux_x = dF_x[mz]
         density_flux_x = dF_x[di]

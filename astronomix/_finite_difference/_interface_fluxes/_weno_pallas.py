@@ -1605,6 +1605,131 @@ def _weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
     )
 
 
+def _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
+    conserved_state,
+    bx_interface,
+    by_interface,
+    bz_interface,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    if not _mhd_pallas_flux_supported(conserved_state, config):
+        raise RuntimeError(
+            "_update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod called when Pallas MHD WENO is unsupported."
+        )
+
+    ndim = int(config.dimensionality)
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=conserved_state.shape[1:],
+    )
+    density = int(registered_variables.density_index)
+    mom_y = int(registered_variables.momentum_index.y)
+    mom_z = int(registered_variables.momentum_index.z)
+    mag_x = int(registered_variables.magnetic_index.x)
+    mag_y = int(registered_variables.magnetic_index.y)
+    mag_z = int(registered_variables.magnetic_index.z)
+    energy = int(registered_variables.pressure_index)
+
+    def _local(state_local, bx_local, by_local, bz_local):
+        bx_i = bx_local[0]
+        by_i = by_local[0]
+        bz_i = bz_local[0]
+
+        def f2c_x(a):
+            return (
+                3.0 * jnp.roll(a, 3, axis=0)
+                - 25.0 * jnp.roll(a, 2, axis=0)
+                + 150.0 * jnp.roll(a, 1, axis=0)
+                + 150.0 * a
+                - 25.0 * jnp.roll(a, -1, axis=0)
+                + 3.0 * jnp.roll(a, -2, axis=0)
+            ) / 256.0
+
+        def f2c_y(a):
+            return (
+                3.0 * jnp.roll(a, 3, axis=1)
+                - 25.0 * jnp.roll(a, 2, axis=1)
+                + 150.0 * jnp.roll(a, 1, axis=1)
+                + 150.0 * a
+                - 25.0 * jnp.roll(a, -1, axis=1)
+                + 3.0 * jnp.roll(a, -2, axis=1)
+            ) / 256.0
+
+        def f2c_z(a):
+            return (
+                3.0 * jnp.roll(a, 3, axis=2)
+                - 25.0 * jnp.roll(a, 2, axis=2)
+                + 150.0 * jnp.roll(a, 1, axis=2)
+                + 150.0 * a
+                - 25.0 * jnp.roll(a, -1, axis=2)
+                + 3.0 * jnp.roll(a, -2, axis=2)
+            ) / 256.0
+
+        bx_center = f2c_x(bx_i)
+        by_center = f2c_y(by_i)
+        bz_center = f2c_z(bz_i)
+        b2_old = (
+            state_local[mag_x] * state_local[mag_x]
+            + state_local[mag_y] * state_local[mag_y]
+            + state_local[mag_z] * state_local[mag_z]
+        )
+        b2_new = bx_center * bx_center + by_center * by_center + bz_center * bz_center
+        state_updated = state_local.at[mag_x].set(bx_center)
+        state_updated = state_updated.at[mag_y].set(by_center)
+        state_updated = state_updated.at[mag_z].set(bz_center)
+        state_updated = state_updated.at[energy].set(
+            state_local[energy] + 0.5 * (b2_new - b2_old)
+        )
+
+        flux = _weno_flux_mhd_pallas_local(
+            state_updated, params, config, registered_variables, axis=0
+        )
+        rho = state_updated[density]
+        bx = state_updated[mag_x]
+        bx_vy = bx * state_updated[mom_y] / rho
+        bx_vz = bx * state_updated[mom_z] / rho
+
+        def c2f_x(a):
+            return (
+                -jnp.roll(a, 1, axis=0)
+                + 9.0 * a
+                + 9.0 * jnp.roll(a, -1, axis=0)
+                - jnp.roll(a, -2, axis=0)
+            ) / 16.0
+
+        flux_x_mod = jnp.stack([
+            flux[mag_y] + c2f_x(bx_vy),
+            flux[mag_z] + c2f_x(bx_vz),
+        ])
+        return state_updated, flux, flux, flux_x_mod
+
+    q_halo = (3, 0, 0)[:ndim]
+    bx_halo = (6, 0, 0)[:ndim]
+    by_halo = (3, 3, 0)[:ndim]
+    bz_halo = (3, 0, 3)[:ndim]
+    shape_halo = tuple(
+        max(vals) for vals in zip(q_halo, bx_halo, by_halo, bz_halo, strict=True)
+    )
+
+    return _pallas_call_sharded(
+        _local,
+        state_inputs=(
+            conserved_state,
+            bx_interface[None],
+            by_interface[None],
+            bz_interface[None],
+        ),
+        halo=shape_halo,
+        block_shape=block_shape[:ndim],
+        input_halos=(q_halo, bx_halo, by_halo, bz_halo),
+        num_state_outputs=4,
+        output_halo=((0, 0, 0), (1, 0, 0), (0, 0, 0), (0, 0, 0)),
+    )
+
+
 def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
                               ncomp, num_modes, use_approx_rsqrt=False):
     """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
