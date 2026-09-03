@@ -49,6 +49,7 @@ from astronomix._finite_difference._interface_fluxes._flux_blending import (
 )
 from astronomix._finite_difference._time_integrators._ssprk_pallas import (
     _div_axis_pallas_shape_ok,
+    _hydro_flux_div_axis_native,
     _hydro_flux_div_axis_pallas,
     _hydro_flux_div_axis_native_from_kept_halo_sharded,
 )
@@ -754,9 +755,14 @@ def _lsrk4_with_ct(
             Bz_flux_y = dF_y[mz]
             density_flux_y = dF_y[di]
             if use_pallas_div:
-                dq = _hydro_flux_div_axis_pallas(
-                    dF_y, dtdy, config, axis=1, rhs_accumulator=dq,
-                )
+                if use_ct_x_precomputed:
+                    dq = _hydro_flux_div_axis_native(
+                        dF_y, dtdy, axis=1, rhs_accumulator=dq,
+                    )
+                else:
+                    dq = _hydro_flux_div_axis_pallas(
+                        dF_y, dtdy, config, axis=1, rhs_accumulator=dq,
+                    )
             else:
                 rhs_q_for_phys = rhs_q_for_phys - dtdy * (dF_y - _shift(dF_y, 1, axis=2))
             del dF_y
@@ -779,9 +785,14 @@ def _lsrk4_with_ct(
             By_flux_z = dF_z[my]
             density_flux_z = dF_z[di]
             if use_pallas_div:
-                dq = _hydro_flux_div_axis_pallas(
-                    dF_z, dtdz, config, axis=2, rhs_accumulator=dq,
-                )
+                if use_ct_x_precomputed:
+                    dq = _hydro_flux_div_axis_native(
+                        dF_z, dtdz, axis=2, rhs_accumulator=dq,
+                    )
+                else:
+                    dq = _hydro_flux_div_axis_pallas(
+                        dF_z, dtdz, config, axis=2, rhs_accumulator=dq,
+                    )
             else:
                 rhs_q_for_phys = rhs_q_for_phys - dtdz * (dF_z - _shift(dF_z, 1, axis=3))
             del dF_z
