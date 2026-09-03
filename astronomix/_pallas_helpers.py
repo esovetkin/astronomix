@@ -291,6 +291,48 @@ def _local_edge_pad(arr, width: int, axis: int, *, left: bool):
     return jnp.tile(edge, reps)
 
 
+def _pair_groups(num_dev: int, parity: int):
+    if parity == 0:
+        return [[i, i + 1] for i in range(0, num_dev, 2)]
+    return [[i, (i + 1) % num_dev] for i in range(1, num_dev, 2)]
+
+
+def _pair_all_to_all_halos(arr, axis: int, width: int, mesh_axis_name, num_dev: int):
+    if num_dev % 2:
+        raise ValueError("pairwise all_to_all halo exchange requires an even mesh axis")
+
+    rank = jax.lax.axis_index(mesh_axis_name)
+    size = arr.shape[axis]
+    left_edge = jax.lax.slice_in_dim(arr, 0, width, axis=axis)
+    right_edge = jax.lax.slice_in_dim(arr, size - width, size, axis=axis)
+    zero = jnp.zeros_like(left_edge)
+
+    def phase(parity: int):
+        first = (rank % 2) == parity
+        payload = jnp.stack(
+            (
+                jnp.where(first, zero, left_edge),
+                jnp.where(first, right_edge, zero),
+            ),
+            axis=0,
+        )
+        exchanged = jax.lax.all_to_all(
+            payload,
+            mesh_axis_name,
+            split_axis=0,
+            concat_axis=0,
+            axis_index_groups=_pair_groups(num_dev, parity),
+            tiled=False,
+        )
+        left = jnp.where(first, zero, exchanged[0])
+        right = jnp.where(first, exchanged[1], zero)
+        return left, right
+
+    left0, right0 = phase(0)
+    left1, right1 = phase(1)
+    return left0 + left1, right0 + right1
+
+
 def _pad_axis_with_input_halo(arr, axis, shape_h, comm_h, mesh_axis_name, num_dev):
     """combines real communicated halo cells with fake local padding
 
@@ -315,13 +357,17 @@ def _pad_axis_with_input_halo(arr, axis, shape_h, comm_h, mesh_axis_name, num_de
         pieces.append(fake_left)
 
     if comm_h > 0:
-        size = arr.shape[axis]
-        left_edge = jax.lax.slice_in_dim(arr, 0, comm_h, axis=axis)
-        right_edge = jax.lax.slice_in_dim(arr, size - comm_h, size, axis=axis)
-        left_perm = [(j, (j - 1) % num_dev) for j in range(num_dev)]
-        right_perm = [(j, (j + 1) % num_dev) for j in range(num_dev)]
-        left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=right_perm)
-        right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=left_perm)
+        left_halo, right_halo = _pair_all_to_all_halos(
+            arr, axis, comm_h, mesh_axis_name, num_dev
+        )
+        # _pair_all_to_all_halos scales better than ppermute
+        # size = arr.shape[axis]
+        # left_edge = jax.lax.slice_in_dim(arr, 0, comm_h, axis=axis)
+        # right_edge = jax.lax.slice_in_dim(arr, size - comm_h, size, axis=axis)
+        # left_perm = [(j, (j - 1) % num_dev) for j in range(num_dev)]
+        # right_perm = [(j, (j + 1) % num_dev) for j in range(num_dev)]
+        # left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=right_perm)
+        # right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=left_perm)
         pieces.extend((left_halo, arr, right_halo))
     else:
         pieces.append(arr)
