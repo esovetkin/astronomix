@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
     FOURTH_ORDER_CONSERVATIVE,
+    PERIODIC_ROLL,
     SECOND_ORDER_CONSERVATIVE,
     SIMPLE_SOURCE,
     STATE_TYPE,
@@ -43,8 +44,10 @@ from astronomix.option_classes.simulation_params import SimulationParams
 
 # astronomix functions
 from astronomix._modules._gravity._poisson_solver import (
+    _active_x_sharded_mesh,
     _compute_gravitational_potential,
 )
+from astronomix._pallas_helpers import _pallas_call_sharded
 from astronomix._modules._gravity._utils import _pad_external_potential
 from astronomix._stencil_operations._stencil_operations import (
     _shift,
@@ -245,9 +248,7 @@ def _fd_gravity_source(
         The full-state source term to be added over this time step.
     """
 
-    gravity_source = jnp.zeros_like(primitive_state)
     grid_spacing = config.grid_spacing
-    self_gravity_version = config.gravity_config.self_gravity_version
 
     gravitational_potential = _compute_total_potential(
         primitive_state[registered_variables.density_index],
@@ -257,6 +258,92 @@ def _fd_gravity_source(
         registered_variables,
         params.gravitational_constant,
     )
+
+    active_mesh = _active_x_sharded_mesh()
+    if (
+        active_mesh is not None
+        and config.dimensionality == 3
+        and config.boundary_handling == PERIODIC_ROLL
+        and config.gravity_config.self_gravity_version == FOURTH_ORDER_CONSERVATIVE
+        and not config.gravity_config.work_flux_correction
+        and primitive_state.shape[1] // active_mesh[0].shape[active_mesh[1]] >= 4
+    ):
+        # The x source reaches four potential planes, two state planes through
+        # momentum's face-averaged gradient, and one x-density-flux plane.
+        # The y/z fluxes and drho need no neighbour data along x. All arrays
+        # receive the same shape padding, then the wrapper strips four planes.
+        def local_source(state, potential, density_change, flux_x, flux_y, flux_z):
+            return _fd_gravity_source_from_potential(
+                state,
+                (flux_x[0], flux_y[0], flux_z[0]),
+                density_change[0],
+                dt,
+                config,
+                params,
+                registered_variables,
+                potential[0],
+            )
+
+        return _pallas_call_sharded(
+            local_source,
+            state_inputs=(
+                primitive_state,
+                gravitational_potential[None],
+                drho[None],
+                *(flux[None] for flux in density_fluxes),
+            ),
+            halo=(4, 0, 0),
+            block_shape=(1, 1, 1),
+            input_halos=(
+                (2, 0, 0),
+                (4, 0, 0),
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 0, 0),
+                (0, 0, 0),
+            ),
+        )
+
+    return _fd_gravity_source_from_potential(
+        primitive_state,
+        density_fluxes,
+        drho,
+        dt,
+        config,
+        params,
+        registered_variables,
+        gravitational_potential,
+    )
+
+
+def _fd_gravity_source_from_potential(
+    primitive_state,
+    density_fluxes,
+    drho,
+    dt,
+    config,
+    params,
+    registered_variables,
+    gravitational_potential,
+):
+    """Evaluate the source stencils on a global grid or a halo-padded shard.
+
+    Args:
+        primitive_state: Primitive fields, including any local halo.
+        density_fluxes: Per-axis density fluxes with the same spatial shape.
+        drho: This stage's density change.
+        dt: The stage time step.
+        config: Static numerical and physics options.
+        params: Dynamic physics parameters.
+        registered_variables: State row indices.
+        gravitational_potential: The already solved total potential.
+
+    Returns:
+        The full-state gravity source with the input spatial shape.
+    """
+    gravity_source = jnp.zeros_like(primitive_state)
+    grid_spacing = config.grid_spacing
+    self_gravity_version = config.gravity_config.self_gravity_version
 
     if self_gravity_version == SIMPLE_SOURCE:
 
