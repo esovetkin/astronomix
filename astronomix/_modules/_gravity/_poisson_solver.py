@@ -26,8 +26,10 @@ from jax.sharding import PartitionSpec
 
 try:  # the stable alias (newer jax)
     from jax import shard_map as _shard_map
+    _SHARD_MAP_CHECK_OPTIONS = {"check_vma": False}
 except ImportError:  # pragma: no cover - older jax
     from jax.experimental.shard_map import shard_map as _shard_map
+    _SHARD_MAP_CHECK_OPTIONS = {"check_rep": False}
 
 # astronomix helpers
 from astronomix._pallas_helpers import _current_pallas_mesh
@@ -109,8 +111,9 @@ def _periodic_poisson_3d_sharded(
     FFT over (y, z) batched over the local X slab, an ``all_to_all``
     transpose of the slab decomposition from X to Y, the X-axis FFT, the
     Green's-function multiply on the local k-slab, and the mirrored
-    inverse.  Per-device memory and FLOPs then stay proportional to the
-    local shard, which is what makes self-gravity weak scaling flat.
+    inverse. The real density uses a Hermitian half-spectrum along z, so the
+    exchanges do not move the redundant negative-z frequencies. Per-device
+    memory and FLOPs stay proportional to the local shard.
 
     Mathematically identical to the replicated branch (same discrete
     transform, Green's function and regularisation); only the data layout
@@ -128,11 +131,11 @@ def _periodic_poisson_3d_sharded(
 
     k_base_x = jnp.fft.fftfreq(num_cells_x, d=grid_spacing) * 2 * jnp.pi
     k_base_y = jnp.fft.fftfreq(num_cells_y, d=grid_spacing) * 2 * jnp.pi
-    k_base_z = jnp.fft.fftfreq(num_cells_z, d=grid_spacing) * 2 * jnp.pi
+    k_base_z = jnp.fft.rfftfreq(num_cells_z, d=grid_spacing) * 2 * jnp.pi
 
     def _local_solve(density_block):
         # density_block: the local X slab, (num_cells_x / P, ny, nz).
-        density_k = jnp.fft.fftn(density_block, axes=(1, 2))
+        density_k = jnp.fft.rfftn(density_block, axes=(1, 2))
         # Transpose the decomposition X -> Y (device p ends up with full X
         # and the p-th Y slab), then transform the now-local X axis.
         density_k = jax.lax.all_to_all(
@@ -164,15 +167,24 @@ def _periodic_poisson_3d_sharded(
         potential_k = jax.lax.all_to_all(
             potential_k, "x", split_axis=0, concat_axis=1, tiled=True
         )
-        potential = jnp.fft.ifftn(potential_k, axes=(1, 2))
+        potential = jnp.fft.irfftn(
+            potential_k,
+            s=(num_cells_y, num_cells_z),
+            axes=(1, 2),
+        )
         return jnp.real(potential)
 
     slab_spec = PartitionSpec("x", None, None)
+    # The real-FFT transpose uses nested linear transposition. JAX's varying
+    # manual-axis checker cannot propagate that rule through the local FFT
+    # on all supported versions. The input/output slab specs are explicit;
+    # disable that checker while retaining the same collective semantics.
     return _shard_map(
         _local_solve,
         mesh=named_mesh,
         in_specs=(slab_spec,),
         out_specs=slab_spec,
+        **_SHARD_MAP_CHECK_OPTIONS,
     )(gas_density)
 
 
